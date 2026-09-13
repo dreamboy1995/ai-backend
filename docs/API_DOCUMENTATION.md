@@ -27,7 +27,7 @@ JWT_SECRET=your_jwt_secret_here
 PORT=3000
 AIDER_MODEL=zai/glm-4.5-air
 AIDER_API_BASE=https://open.bigmodel.cn/api/paas/v4
-ZAI_API_KEY=12139402cf79409582813f5ada668907.5nmPAhhtXT5NMiO7
+ZAI_API_KEY=xxx
 JWT_SECRET=xxx
 ```
 
