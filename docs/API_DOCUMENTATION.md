@@ -1,14 +1,14 @@
-# AI Backend API 接口文档
+# AI Backend API 文档
 
 ## 概述
 
-AI Backend 是一个基于 FastAPI 的后端服务，用于代理 ZAI（智谱AI）的大模型 API。目前实现了流式聊天完成接口，支持 OpenAI 兼容的 SSE 格式。
+AI Backend 是一个基于 FastAPI 的后端服务，用于代理 ZAI 大模型 API，提供流式聊天功能。支持 JWT 认证，确保 API 安全访问。
 
 ## 基础信息
 
-- **基础 URL**: `http://localhost:3000`
-- **API 版本**: `/v1`
-- **认证方式**: 暂未实现（后续将添加 JWT 认证）
+- **基础URL**: `http://localhost:3000`
+- **认证方式**: JWT Bearer Token
+- **API版本**: v1
 - **响应格式**: JSON / SSE（流式）
 
 ## 环境配置
@@ -26,6 +26,7 @@ JWT_SECRET=your_jwt_secret_here
 ```env
 PORT=3000
 AIDER_MODEL=zai/glm-4.5-air
+AIDER_API_BASE=https://open.bigmodel.cn/api/paas/v4
 ZAI_API_KEY=12139402cf79409582813f5ada668907.5nmPAhhtXT5NMiO7
 JWT_SECRET=xxx
 ```
@@ -85,15 +86,97 @@ JWT_SECRET=xxx
 
 ---
 
-### 3. 聊天完成接口（流式）
+### 3. 获取访问令牌
 
-**POST** `/v1/chat/completions`
+**POST** `/auth/api-key`
 
-代理 ZAI API 的聊天完成接口，支持流式响应。
+使用 API Key 获取 JWT 访问令牌。
 
 #### 请求头
 
 ```
+Content-Type: application/json
+```
+
+#### 请求体
+
+```json
+{
+  "api_key": "your_api_key_here",
+  "model": "glm-4v"
+}
+```
+
+#### 字段说明
+
+| 字段 | 类型 | 必需 | 默认值 | 描述 |
+|------|------|------|--------|------|
+| api_key | string | 是 | - | 用户的 ZAI API 密钥 |
+| model | string | 否 | "glm-4v" | 指定使用的模型 |
+
+#### 响应
+
+```json
+{
+  "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "token_type": "bearer",
+  "expires_in": 86400
+}
+```
+
+#### 字段说明
+
+| 字段 | 类型 | 描述 |
+|------|------|------|
+| access_token | string | JWT 访问令牌 |
+| token_type | string | 令牌类型，固定为 "bearer" |
+| expires_in | number | 令牌有效期（秒），默认 24 小时 |
+
+#### 状态码
+
+- `200`: 令牌获取成功
+- `401`: API Key 无效
+
+---
+
+### 4. 用户登出
+
+**POST** `/auth/logout`
+
+使当前 JWT 令牌失效，加入黑名单。
+
+#### 请求头
+
+```
+Authorization: Bearer {access_token}
+Content-Type: application/json
+```
+
+#### 响应
+
+```json
+{
+  "message": "登出成功"
+}
+```
+
+#### 状态码
+
+- `200`: 登出成功
+- `401`: 令牌无效
+
+---
+
+### 5. 聊天完成接口（流式）
+
+**POST** `/v1/chat/completions`
+
+代理 ZAI API 的聊天完成接口，支持流式响应。需要 JWT 认证。
+
+#### 请求头
+
+```
+Authorization: Bearer {access_token}
 Content-Type: application/json
 ```
 
@@ -224,14 +307,15 @@ data: {"id":"","object":"chat.completion.chunk","created":0,"model":"","choices"
 #### 状态码
 
 - `200`: 请求成功（流式响应）
+- `401`: 未认证或令牌无效
 - `400`: 请求参数错误
 - `500`: 服务器内部错误
 
 ---
 
-### 4. 测试接口
+### 6. 测试接口
 
-#### 4.1 测试业务异常
+#### 6.1 测试业务异常
 
 **GET** `/test-error`
 
@@ -253,7 +337,7 @@ data: {"id":"","object":"chat.completion.chunk","created":0,"model":"","choices"
 
 ---
 
-#### 4.2 测试参数校验
+#### 6.2 测试参数校验
 
 **POST** `/test-validation`
 
@@ -285,7 +369,7 @@ data: {"id":"","object":"chat.completion.chunk","created":0,"model":"","choices"
 
 ---
 
-#### 4.3 测试未处理异常
+#### 6.3 测试未处理异常
 
 **GET** `/test-500`
 
@@ -312,6 +396,7 @@ data: {"id":"","object":"chat.completion.chunk","created":0,"model":"","choices"
 | 错误码 | 错误信息 | 描述 |
 |--------|----------|------|
 | 400 | 请求参数错误 | 请求参数不合法 |
+| 401 | 未认证或令牌无效 | 缺少或无效的 JWT 令牌 |
 | 422 | 请求参数校验失败 | 请求参数格式错误 |
 | 500 | 服务器内部错误 | 服务器处理请求时发生错误 |
 
@@ -320,26 +405,37 @@ data: {"id":"","object":"chat.completion.chunk","created":0,"model":"","choices"
 ### cURL 示例
 
 ```bash
-# 健康检查
-curl http://localhost:3000/health
+# 1. 获取访问令牌
+curl -X POST "http://localhost:3000/auth/api-key" \
+     -H "Content-Type: application/json" \
+     -d '{"api_key": "your_api_key_here"}'
 
-# 配置检查
-curl http://localhost:3000/config-check
+# 响应示例
+{
+    "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+    "token_type": "bearer",
+    "expires_in": 86400
+}
 
-# 聊天完成（流式）
-curl -X POST http://localhost:3000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "messages": [
-      {
-        "role": "user",
-        "content": "你好，请介绍一下你自己"
-      }
-    ],
-    "model": "glm-4v",
-    "temperature": 0.7,
-    "stream": true
-  }'
+# 2. 使用令牌调用聊天接口
+curl -X POST "http://localhost:3000/v1/chat/completions" \
+     -H "Content-Type: application/json" \
+     -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." \
+     -d '{
+         "messages": [
+             {
+                 "role": "user",
+                 "content": "你好，请介绍一下你自己"
+             }
+         ],
+         "model": "glm-4v",
+         "temperature": 0.7,
+         "stream": true
+     }'
+
+# 3. 用户登出
+curl -X POST "http://localhost:3000/auth/logout" \
+     -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
 ```
 
 ### Python 示例
@@ -348,13 +444,20 @@ curl -X POST http://localhost:3000/v1/chat/completions \
 import requests
 import json
 
-# 健康检查
-response = requests.get("http://localhost:3000/health")
-print(response.json())
+# 1. 获取访问令牌
+token_response = requests.post(
+    "http://localhost:3000/auth/api-key",
+    json={"api_key": "your_api_key_here"}
+)
+access_token = token_response.json()["access_token"]
 
-# 聊天完成（流式）
+# 2. 聊天完成（流式）
 response = requests.post(
     "http://localhost:3000/v1/chat/completions",
+    headers={
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    },
     json={
         "messages": [
             {
@@ -372,21 +475,36 @@ response = requests.post(
 for line in response.iter_lines():
     if line:
         print(line.decode('utf-8'))
+
+# 3. 用户登出
+requests.post(
+    "http://localhost:3000/auth/logout",
+    headers={"Authorization": f"Bearer {access_token}"}
+)
 ```
 
 ### JavaScript 示例
 
 ```javascript
-// 健康检查
-fetch('http://localhost:3000/health')
-  .then(response => response.json())
-  .then(data => console.log(data));
+// 1. 获取访问令牌
+const tokenResponse = await fetch('http://localhost:3000/auth/api-key', {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+  },
+  body: JSON.stringify({
+    api_key: 'your_api_key_here'
+  })
+});
 
-// 聊天完成（流式）
+const { access_token } = await tokenResponse.json();
+
+// 2. 聊天完成（流式）
 const response = await fetch('http://localhost:3000/v1/chat/completions', {
   method: 'POST',
   headers: {
     'Content-Type': 'application/json',
+    'Authorization': `Bearer ${access_token}`
   },
   body: JSON.stringify({
     messages: [
@@ -411,15 +529,25 @@ while (true) {
   const chunk = decoder.decode(value);
   console.log(chunk);
 }
+
+// 3. 用户登出
+await fetch('http://localhost:3000/auth/logout', {
+  method: 'POST',
+  headers: {
+    'Authorization': `Bearer ${access_token}`
+  }
+});
 ```
 
 ## 注意事项
 
-1. **流式响应**: 聊天完成接口默认返回流式响应，需要特殊处理 SSE 格式。
-2. **错误处理**: 所有接口都有完善的错误处理机制，会返回统一的错误格式。
-3. **环境配置**: 确保 `.env` 文件中的 `ZAI_API_KEY` 配置正确。
-4. **CORS**: 当前配置允许所有来源的跨域请求，生产环境应限制具体域名。
-5. **性能**: 流式响应使用异步处理，适合实时对话场景。
+1. **JWT 认证**: 除了健康检查和文档接口外，所有接口都需要 JWT 认证
+2. **令牌有效期**: JWT 令牌默认有效期为 24 小时
+3. **流式响应**: 聊天完成接口默认返回流式响应，需要特殊处理 SSE 格式
+4. **错误处理**: 所有接口都有完善的错误处理机制，会返回统一的错误格式
+5. **环境配置**: 确保 `.env` 文件中的 `ZAI_API_KEY` 和 `JWT_SECRET` 配置正确
+6. **CORS**: 当前配置允许所有来源的跨域请求，生产环境应限制具体域名
+7. **性能**: 流式响应使用异步处理，适合实时对话场景
 
 ## 更新日志
 
@@ -428,6 +556,6 @@ while (true) {
 - 实现基础健康检查接口
 - 实现配置检查接口
 - 实现聊天完成接口（流式）
-- 实现测试接口
+- 实现 JWT 认证机制
 - 添加全局异常处理
 - 支持 ZAI API 代理
