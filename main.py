@@ -26,11 +26,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from routers.chat import router as chat_router
+from routers.auth import router as auth_router
 from exception_handlers import (
     request_validation_exception_handler,
     http_exception_handler,
     unhandled_exception_handler
 )
+from auth import verify_token
 
 
 # =========================
@@ -113,11 +115,48 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(chat_router)
+# 注册路由
+app.include_router(chat_router, prefix="/v1", tags=["聊天"])
+app.include_router(auth_router, tags=["认证"])
 
 
 # =========================
-# 6. 全局异常过滤器 / 异常处理器
+# 6. JWT中间件
+# =========================
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    # 允许健康检查接口无需认证
+    if request.url.path == "/health" or request.url.path.startswith("/docs"):
+        response = await call_next(request)
+        return response
+    
+    # 检查Authorization头
+    auth_header = request.headers.get("authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="缺少认证令牌",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    token = auth_header[7:]  # 去掉"Bearer "前缀
+    
+    try:
+        # 验证Token
+        verify_token(token)
+    except HTTPException:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="无效的认证令牌",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    response = await call_next(request)
+    return response
+
+
+# =========================
+# 7. 全局异常过滤器 / 异常处理器
 # =========================
 
 # 5.1 请求参数校验失败
@@ -131,7 +170,7 @@ app.add_exception_handler(Exception, unhandled_exception_handler)
 
 
 # =========================
-# 7. 示例路由
+# 8. 示例路由
 # =========================
 class Item(BaseModel):
     name: str
@@ -178,7 +217,7 @@ async def test_500():
 
 
 # =========================
-# 8. 本地启动入口
+# 9. 本地启动入口
 # =========================
 if __name__ == "__main__":
     uvicorn.run(

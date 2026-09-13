@@ -2,3 +2,6 @@ fastapi
 uvicorn[standard]
 pydantic-settings
 python-dotenv
+python-jose[cryptography]
+python-multipart
+httpx

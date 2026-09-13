@@ -3,12 +3,13 @@ import asyncio
 import json
 import uuid
 import os
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse, JSONResponse
 from typing import Optional
 
 from schemas import ChatRequest, ChatChunk, Choice, Delta, Usage
 from adapters.zai_adapter import ZAIAdapter
+from auth import get_current_user
 
 router = APIRouter()
 
@@ -28,10 +29,11 @@ async def get_zai_adapter() -> ZAIAdapter:
         _zai_adapter = ZAIAdapter(api_key=api_key)
     return _zai_adapter
 
-@router.post("/v1/chat/completions")
+@router.post("/chat/completions")
 async def chat_completions(
     request: ChatRequest,
-    zai_adapter: ZAIAdapter = Depends(get_zai_adapter)
+    zai_adapter: ZAIAdapter = Depends(get_zai_adapter),
+    current_user: dict = Depends(get_current_user)
 ):
     """
     聊天完成接口 - 代理到ZAI API
