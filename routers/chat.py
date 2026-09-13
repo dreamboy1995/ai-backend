@@ -44,9 +44,9 @@ async def chat_completions(
                 detail="Messages are required"
             )
         
-        # 构建适配器需要的参数
+        # 构建适配器需要的参数 - 将ChatMessage对象转换为字典
         adapter_params = {
-            "messages": request.messages,
+            "messages": [message.model_dump() for message in request.messages],
             "model": request.model or "glm-4v",
             "temperature": request.temperature or 0.7,
             "stream": request.stream or True
