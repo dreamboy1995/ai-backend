@@ -49,7 +49,7 @@ async def chat_completions(
         # 构建适配器需要的参数 - 将ChatMessage对象转换为字典
         adapter_params = {
             "messages": [message.model_dump() for message in request.messages],
-            "model": request.model or "glm-4v",
+            "model": request.model or "glm-4.5-air",
             "temperature": request.temperature or 0.7,
             "stream": request.stream or True
         }

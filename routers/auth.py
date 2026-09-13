@@ -10,7 +10,7 @@ security = HTTPBearer()
 
 class TokenRequest(BaseModel):
     api_key: str
-    model: Optional[str] = "glm-4v"
+    model: Optional[str] = "glm-4.5-air"
 
 class TokenResponse(BaseModel):
     access_token: str

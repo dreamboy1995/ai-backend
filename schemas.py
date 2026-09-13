@@ -11,7 +11,7 @@ class ChatMessage(BaseModel):
 
 class ChatRequest(BaseModel):
     messages: List[ChatMessage]
-    model: str = "glm-4v"
+    model: str = "glm-4.5-air"
     temperature: float = 0.7
     stream: bool = True
     max_tokens: Optional[int] = None
@@ -40,7 +40,7 @@ class ChatChunk(BaseModel):
     """
     标准 SSE 流式 DTO，一条 chunk 对应一次 data: 推送
     例：{"id":"chatcmpl-xxx","object":"chat.completion.chunk",
-         "created":1699999999,"model":"glm-4v",
+         "created":1699999999,"model":"glm-4.5-air",
          "choices":[{"index":0,"delta":{"content":"你"},"finish_reason":null}]}
     """
     id: str

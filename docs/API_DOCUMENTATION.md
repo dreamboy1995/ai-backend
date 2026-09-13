@@ -103,7 +103,7 @@ Content-Type: application/json
 ```json
 {
   "api_key": "your_api_key_here",
-  "model": "glm-4v"
+  "model": "glm-4.5-air"
 }
 ```
 
@@ -112,7 +112,7 @@ Content-Type: application/json
 | 字段 | 类型 | 必需 | 默认值 | 描述 |
 |------|------|------|--------|------|
 | api_key | string | 是 | - | 用户的 ZAI API 密钥 |
-| model | string | 否 | "glm-4v" | 指定使用的模型 |
+| model | string | 否 | "glm-4.5-air" | 指定使用的模型 |
 
 #### 响应
 
@@ -190,7 +190,7 @@ Content-Type: application/json
       "content": "你好，请介绍一下你自己"
     }
   ],
-  "model": "glm-4v",
+  "model": "glm-4.5-air",
   "temperature": 0.7,
   "stream": true,
   "max_tokens": null
@@ -202,7 +202,7 @@ Content-Type: application/json
 | 字段 | 类型 | 必需 | 默认值 | 描述 |
 |------|------|------|--------|------|
 | messages | Array[ChatMessage] | 是 | - | 消息列表 |
-| model | string | 否 | "glm-4v" | 模型名称 |
+| model | string | 否 | "glm-4.5-air" | 模型名称 |
 | temperature | number | 否 | 0.7 | 温度参数，控制随机性 |
 | stream | boolean | 否 | true | 是否流式输出 |
 | max_tokens | number | 否 | null | 最大令牌数 |
@@ -221,10 +221,10 @@ Content-Type: application/json
 流式响应（SSE），格式如下：
 
 ```
-data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1699999999,"model":"glm-4v","choices":[{"index":0,"delta":{"content":"你好"},"finish_reason":null}]}
-data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1699999999,"model":"glm-4v","choices":[{"index":0,"delta":{"content":"，"},"finish_reason":null}]}
+data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1699999999,"model":"glm-4.5-air","choices":[{"index":0,"delta":{"content":"你好"},"finish_reason":null}]}
+data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1699999999,"model":"glm-4.5-air","choices":[{"index":0,"delta":{"content":"，"},"finish_reason":null}]}
 ...
-data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1699999999,"model":"glm-4v","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1699999999,"model":"glm-4.5-air","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
 data: [DONE]
 ```
 
@@ -235,7 +235,7 @@ data: [DONE]
   "id": "chatcmpl-123",
   "object": "chat.completion.chunk",
   "created": 1699999999,
-  "model": "glm-4v",
+  "model": "glm-4.5-air",
   "choices": [
     {
       "index": 0,
@@ -428,7 +428,7 @@ curl -X POST "http://localhost:3000/v1/chat/completions" \
                  "content": "你好，请介绍一下你自己"
              }
          ],
-         "model": "glm-4v",
+         "model": "glm-4.5-air",
          "temperature": 0.7,
          "stream": true
      }'
@@ -465,7 +465,7 @@ response = requests.post(
                 "content": "你好，请介绍一下你自己"
             }
         ],
-        "model": "glm-4v",
+        "model": "glm-4.5-air",
         "temperature": 0.7,
         "stream": True
     },
@@ -513,7 +513,7 @@ const response = await fetch('http://localhost:3000/v1/chat/completions', {
         content: '你好，请介绍一下你自己'
       }
     ],
-    model: 'glm-4v',
+    model: 'glm-4.5-air',
     temperature: 0.7,
     stream: true
   })

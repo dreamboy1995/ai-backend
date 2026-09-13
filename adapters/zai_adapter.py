@@ -25,7 +25,7 @@ class ZAIAdapter:
     async def chat_completion(
         self,
         messages: list,
-        model: str = "glm-4v",
+        model: str = "glm-4.5-air",
         temperature: float = 0.7,
         stream: bool = True,
         **kwargs
