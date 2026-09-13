@@ -1,5 +1,5 @@
 # schemas.py
-from typing import List, Dict, Optional, Literal
+from typing import List, Dict, Optional, Literal, Any
 from pydantic import BaseModel, Field
 import time
 
@@ -27,7 +27,7 @@ class Choice(BaseModel):
     index: int = 0
     delta: Optional[Delta] = None
     finish_reason: Optional[str] = None
-    error: Optional[Dict[str, any]] = None
+    error: Optional[Dict[str, Any]] = None
 
 
 class Usage(BaseModel):
