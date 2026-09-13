@@ -15,6 +15,7 @@ docs_url="/docs" 就是 Swagger 文档路由。
 import logging
 import os
 from contextlib import asynccontextmanager
+from dotenv import load_dotenv
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, status
@@ -33,7 +34,14 @@ from exception_handlers import (
 
 
 # =========================
-# 1. 读取 .env 配置
+# 1. 加载 .env 文件
+# =========================
+# 在程序启动时加载 .env 文件
+load_dotenv()
+
+
+# =========================
+# 2. 读取 .env 配置
 # =========================
 class Settings(BaseSettings):
     PORT: int = 3000
@@ -52,7 +60,7 @@ settings = Settings()
 
 
 # =========================
-# 2. 日志配置
+# 3. 日志配置
 # =========================
 logging.basicConfig(
     level=logging.INFO,
@@ -62,7 +70,7 @@ logger = logging.getLogger("ai-backend")
 
 
 # =========================
-# 3. 应用生命周期管理
+# 4. 应用生命周期管理
 # =========================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -84,7 +92,7 @@ async def lifespan(app: FastAPI):
 
 
 # =========================
-# 4. 创建 FastAPI 应用
+# 5. 创建 FastAPI 应用
 # =========================
 app = FastAPI(
     title="AI Backend",
@@ -109,7 +117,7 @@ app.include_router(chat_router)
 
 
 # =========================
-# 5. 全局异常过滤器 / 异常处理器
+# 6. 全局异常过滤器 / 异常处理器
 # =========================
 
 # 5.1 请求参数校验失败
@@ -123,7 +131,7 @@ app.add_exception_handler(Exception, unhandled_exception_handler)
 
 
 # =========================
-# 6. 示例路由
+# 7. 示例路由
 # =========================
 class Item(BaseModel):
     name: str
@@ -170,7 +178,7 @@ async def test_500():
 
 
 # =========================
-# 7. 本地启动入口
+# 8. 本地启动入口
 # =========================
 if __name__ == "__main__":
     uvicorn.run(
