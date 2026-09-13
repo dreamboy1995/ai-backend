@@ -83,3 +83,17 @@ def validate_api_key(api_key: str) -> bool:
     # 这里可以添加实际的API Key验证逻辑
     # 例如：调用ZAI API的验证接口
     return True
+
+def get_current_user(credentials: str) -> dict:
+    """
+    获取当前用户信息
+    """
+    try:
+        payload = verify_token(credentials)
+        return payload
+    except HTTPException:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="无效的认证凭据",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
