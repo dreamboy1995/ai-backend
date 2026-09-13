@@ -78,17 +78,17 @@ logger = logging.getLogger("ai-backend")
 async def lifespan(app: FastAPI):
     # 启动时执行
     logger.info("Starting AI Backend application")
-    
+
     # 检查必要的环境变量
     required_env_vars = ["ZAI_API_KEY"]
     missing_vars = [var for var in required_env_vars if not os.getenv(var)]
-    
+
     if missing_vars:
         logger.error(f"Missing required environment variables: {missing_vars}")
         raise RuntimeError(f"Missing required environment variables: {missing_vars}")
-    
+
     yield
-    
+
     # 关闭时执行
     logger.info("Shutting down AI Backend application")
 
@@ -125,11 +125,13 @@ app.include_router(auth_router, tags=["认证"])
 # =========================
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    # 允许健康检查接口无需认证
-    if request.url.path == "/health" or request.url.path.startswith("/docs"):
+    # 允许健康检查接口、文档接口和认证接口无需认证
+    if (request.url.path == "/health" or
+            request.url.path.startswith("/docs") or
+            request.url.path.startswith("/auth/")):
         response = await call_next(request)
         return response
-    
+
     # 检查Authorization头
     auth_header = request.headers.get("authorization")
     if not auth_header or not auth_header.startswith("Bearer "):
@@ -138,9 +140,9 @@ async def auth_middleware(request: Request, call_next):
             detail="缺少认证令牌",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    
+
     token = auth_header[7:]  # 去掉"Bearer "前缀
-    
+
     try:
         # 验证Token
         verify_token(token)
@@ -150,7 +152,7 @@ async def auth_middleware(request: Request, call_next):
             detail="无效的认证令牌",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    
+
     response = await call_next(request)
     return response
 

@@ -7,10 +7,6 @@ import sys
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse, JSONResponse
 from typing import Optional
-
-# 添加项目根目录到Python路径，确保能导入根目录下的模块
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 from schemas import ChatRequest, ChatChunk, Choice, Delta, Usage
 from adapters.zai_adapter import ZAIAdapter
 from auth import get_current_user

@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from datetime import timedelta
-from ..auth import create_access_token, verify_token, validate_api_key, add_to_blacklist
+from auth import create_access_token, verify_token, validate_api_key, add_to_blacklist
 from pydantic import BaseModel
 from typing import Optional
 
