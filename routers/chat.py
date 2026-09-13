@@ -9,7 +9,7 @@ from typing import Optional
 
 from schemas import ChatRequest, ChatChunk, Choice, Delta, Usage
 from adapters.zai_adapter import ZAIAdapter
-from ..auth import get_current_user
+from auth import get_current_user
 
 router = APIRouter()
 
