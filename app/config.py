@@ -20,6 +20,10 @@ class Settings(BaseSettings):
     SESSION_TOKEN_MARGIN: float = 0.2     # Token 余量比例，触发裁剪阈值 = budget * (1 - margin)
     SESSION_MAX_ROUNDS: int = 5           # 保留的最近对话轮数（1 轮 = user + assistant）
 
+    # 上下文拼装相关配置（第 15-16 天：后端上下文拼装 & 系统提示词工程）
+    SESSION_CONTEXT_TOKEN_RATIO: float = 0.5  # 上下文（System Prompt + 文件内容）占用 Token 阈值的比例
+    # 上下文预算 = 阈值(6400) * 0.5 = 3200，剩余 3200 留给对话历史
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

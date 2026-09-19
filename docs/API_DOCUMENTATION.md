@@ -186,13 +186,33 @@ Content-Type: application/json
   "messages": [
     {
       "role": "user",
-      "content": "你好，请介绍一下你自己"
+      "content": "@main.py 这个函数是干嘛的？"
     }
   ],
   "model": "glm-4.5-air",
   "temperature": 0.7,
   "stream": true,
-  "max_tokens": null
+  "max_tokens": null,
+  "contexts": [
+    {
+      "type": "file",
+      "file_path": "src/main.py",
+      "content_snippet": "def hello():\n    print('hello')\n",
+      "language": "python"
+    },
+    {
+      "type": "selection",
+      "file_path": "src/utils.js",
+      "content_snippet": "function formatDate(d) { return d.toISOString(); }",
+      "language": "javascript"
+    },
+    {
+      "type": "implicit",
+      "file_path": "src/utils.js",
+      "content_snippet": "// 当前激活文件全文（截断后）",
+      "language": "javascript"
+    }
+  ]
 }
 ```
 
@@ -206,6 +226,38 @@ Content-Type: application/json
 | temperature | number | 否 | 0.7 | 温度参数，控制随机性 |
 | stream | boolean | 否 | true | 是否流式输出 |
 | max_tokens | number | 否 | null | 最大令牌数 |
+| contexts | Array[ContextItem] | 否 | null | S2 新增。上下文数组，承载 @文件 / @选中代码 / 隐式上下文。ContextBuilder 将其格式化为结构化 XML 标签插入 System Prompt，并纳入 Token 裁剪计算 |
+
+#### ContextItem 结构（S2 第 13-14 天新增）
+
+```json
+{
+  "type": "file",
+  "file_path": "src/main.py",
+  "content_snippet": "def hello():\n    print('hello')\n",
+  "language": "python"
+}
+```
+
+#### 字段说明
+
+| 字段 | 类型 | 必需 | 默认值 | 描述 |
+|------|------|------|--------|------|
+| type | string | 是 | - | 上下文类型，枚举值：`file`（用户主动 @ 的整个文件）、`selection`（编辑器选中的代码片段）、`implicit`（插件自动附带的当前激活文件，不显示 @ 标签） |
+| file_path | string | 是 | - | 文件路径，非空字符串。用于在 System Prompt 中标注来源 |
+| content_snippet | string | 是 | - | 已截断的文件/代码片段内容。后端对单条 snippet 上限做防御性校验（50000 字符，约 12500 token），超过返回 422 拒绝 |
+| language | string | 否 | null | 文件语言（如 `python` / `javascript`），用于代码块语言标签 |
+
+#### 上下文截断规则（关键，研发必读）
+
+⚠️ **大文件截断必须在插件端完成**，后端只做防御性校验：
+
+- **截断策略**：只取头尾各 200 行 + 光标所在行附近 50 行，绝对禁止把 1 万行的文件全量塞进去，否则后端 Token 直接爆炸。
+- **后端防御**：单条 `content_snippet` 超过 50000 字符时返回 422 错误，提示客户端先做截断。
+- **Token 计数**：后端使用 `tiktoken` 的 `cl100k_base` 编码精确计数（S2 关键技术预研要求，不可用字符串长度 / 4 估算，DeepSeek/中文场景 Token 比例差异大）。
+- **拼装方式**：ContextBuilder 将上下文拼装为 `<context_files><file path="..." lang="...">...</file></context_files>` 结构化 XML 标签，与基础系统提示词合并后置于消息列表首位。系统提示词 Token 纳入裁剪预算，保证总 Token 不超限。
+- **丢弃优先级**：当总 Token 超限时，按文件优先级丢弃——用户主动 `@` 的（file/selection）保留，自动附带的 implicit 当前文件优先截断或丢弃。
+- **系统提示词内容**：包含助手角色定义、代码块输出规范（要求使用 ```language 围栏，配合 Apply 功能）、以及上下文 XML。
 
 #### 会话管理说明（S2 第 11-12 天）
 

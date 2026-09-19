@@ -130,11 +130,13 @@ class SessionService:
                 f"role={msg.get('role')}, 当前历史条数={len(history)}"
             )
 
-    def get_history(self, session_id: str) -> List[dict]:
+    def get_history(self, session_id: str, reserved_tokens: int = 0) -> List[dict]:
         """
         获取裁剪后的会话历史。
         - 若会话不存在或已过期，返回空列表。
         - 裁剪策略：保留 System 消息 + 最近 N 轮对话，超出 Token 预算时丢弃最旧非 System 消息。
+        - reserved_tokens：为系统提示词（含上下文 XML）预留的 Token 数，会从裁剪阈值中扣除，
+          保证「系统提示词 + 历史」总 Token 不超限（S2 第 15-16 天要求）。
         """
         with self._lock:
             if session_id not in self._store:
@@ -148,11 +150,12 @@ class SessionService:
             self._refresh_expiry_locked(session_id)
 
         # 在锁外执行裁剪（裁剪不涉及共享状态修改）
-        trimmed = self._trim_history(raw_history)
+        trimmed = self._trim_history(raw_history, reserved_tokens=reserved_tokens)
         logger.info(
             f"[Session] 裁剪历史: session={session_id}, "
             f"原始条数={len(raw_history)}, 裁剪后条数={len(trimmed)}, "
-            f"原始Token={count_tokens(raw_history)}, 裁剪后Token={count_tokens(trimmed)}"
+            f"原始Token={count_tokens(raw_history)}, 裁剪后Token={count_tokens(trimmed)}, "
+            f"预留系统提示词Token={reserved_tokens}"
         )
         return trimmed
 
@@ -174,15 +177,21 @@ class SessionService:
     # ------------------------------------------------------------------
     # 滑动窗口裁剪算法
     # ------------------------------------------------------------------
-    def _trim_history(self, messages: List[dict]) -> List[dict]:
+    def _trim_history(self, messages: List[dict], reserved_tokens: int = 0) -> List[dict]:
         """
         滑动窗口裁剪：
         1. System 消息始终保留。
         2. 非 System 消息仅保留最近 max_rounds * 2 条（即最近 N 轮 user+assistant）。
         3. 若仍超过 Token 阈值，从最旧的非 System 消息开始逐条丢弃，直到低于阈值。
+
+        reserved_tokens：为系统提示词（含上下文 XML）预留的 Token，从裁剪阈值中扣除。
+        实际可用阈值 = max(0, token_threshold - reserved_tokens)。
         """
         if not messages:
             return []
+
+        # 扣除为系统提示词预留的 Token，得到历史消息可用阈值
+        effective_threshold = max(0, self._token_threshold - reserved_tokens)
 
         system_msgs = [m for m in messages if m.get("role") == "system"]
         non_system = [m for m in messages if m.get("role") != "system"]
@@ -199,14 +208,15 @@ class SessionService:
 
         trimmed = system_msgs + non_system
 
-        # 步骤 3：按 Token 预算裁剪
+        # 步骤 3：按 Token 预算裁剪（使用扣除预留后的阈值）
         current_tokens = count_tokens(trimmed)
-        if current_tokens > self._token_threshold:
+        if current_tokens > effective_threshold:
             logger.debug(
-                f"[Session] Token 超限: 当前 {current_tokens} > 阈值 {self._token_threshold}, "
+                f"[Session] Token 超限: 当前 {current_tokens} > 有效阈值 {effective_threshold} "
+                f"(总阈值 {self._token_threshold} - 预留 {reserved_tokens}), "
                 f"开始逐条丢弃最旧非System消息"
             )
-            while current_tokens > self._token_threshold and non_system:
+            while current_tokens > effective_threshold and non_system:
                 non_system.pop(0)
                 trimmed = system_msgs + non_system
                 current_tokens = count_tokens(trimmed)
