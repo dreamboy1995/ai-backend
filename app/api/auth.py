@@ -2,23 +2,25 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from datetime import timedelta
 from app.auth import create_access_token, verify_token, validate_api_key, add_to_blacklist
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
+from pydantic.alias_generators import to_camel
 from typing import Optional
 
 router = APIRouter()
 security = HTTPBearer()
 
 class TokenRequest(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
     api_key: str
     model: Optional[str] = "glm-4.5-air"
 
 class TokenResponse(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
     access_token: str
-    token_type: str = "bearer"
     expires_in: int
 
-@router.post("/auth/api-key", response_model=TokenResponse)
-async def get_api_key_token(request: TokenRequest):
+@router.post("/auth/token", response_model=TokenResponse, response_model_by_alias=True)
+async def get_token(request: TokenRequest):
     """
     使用API Key获取访问令牌
     """
@@ -28,14 +30,14 @@ async def get_api_key_token(request: TokenRequest):
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="无效的API Key"
         )
-    
+
     # 创建访问令牌
     access_token_expires = timedelta(minutes=60 * 24)  # 24小时
     access_token = create_access_token(
         data={"sub": request.api_key, "model": request.model},
         expires_delta=access_token_expires
     )
-    
+
     return TokenResponse(
         access_token=access_token,
         expires_in=access_token_expires.seconds

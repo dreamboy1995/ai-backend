@@ -78,6 +78,8 @@ async def chat_completions(
                             usage=chunk.get("usage")
                         )
                         yield f"data: {chat_chunk.model_dump_json()}\n\n"
+                    # 流正常结束，发送 [DONE] 标记（OpenAI 标准）
+                    yield "data: [DONE]\n\n"
                 except ZAIRateLimitError as e:
                     logger.warning(f"Rate limit error: {e.message}")
                     yield f'data: {{"error": {{"code": {e.code}, "msg": "{e.message}"}}}}\n\n'

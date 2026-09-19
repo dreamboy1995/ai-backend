@@ -21,15 +21,15 @@ async def test_normal_request():
     async with httpx.AsyncClient() as client:
         # 先获取 token
         auth_response = await client.post(
-            f"{BASE_URL}/auth/api-key",
-            json={"api_key": TEST_API_KEY}
+            f"{BASE_URL}/auth/token",
+            json={"apiKey": TEST_API_KEY}
         )
         print(f"Auth status: {auth_response.status_code}")
         if auth_response.status_code != 200:
             print(f"Auth failed: {auth_response.text}")
             return
         
-        token = auth_response.json()["access_token"]
+        token = auth_response.json()["accessToken"]
         print(f"Got token: {token[:20]}...")
         
         # 发送聊天请求
@@ -71,8 +71,8 @@ async def test_invalid_api_key():
     print("\n=== 测试无效 API Key ===")
     async with httpx.AsyncClient() as client:
         auth_response = await client.post(
-            f"{BASE_URL}/auth/api-key",
-            json={"api_key": "invalid_key_12345"}
+            f"{BASE_URL}/auth/token",
+            json={"apiKey": "invalid_key_12345"}
         )
         print(f"Auth status: {auth_response.status_code}")
         print(f"Response: {auth_response.text}")
@@ -99,14 +99,14 @@ async def test_timeout_simulation():
     async with httpx.AsyncClient() as client:
         # 先获取 token
         auth_response = await client.post(
-            f"{BASE_URL}/auth/api-key",
-            json={"api_key": TEST_API_KEY}
+            f"{BASE_URL}/auth/token",
+            json={"apiKey": TEST_API_KEY}
         )
         if auth_response.status_code != 200:
             print(f"Auth failed: {auth_response.text}")
             return
         
-        token = auth_response.json()["access_token"]
+        token = auth_response.json()["accessToken"]
         
         # 发送超长内容
         long_content = "这是一段非常长的文本，" * 10000

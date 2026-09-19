@@ -88,7 +88,7 @@ JWT_SECRET=xxx
 
 ### 3. 获取访问令牌
 
-**POST** `/auth/api-key`
+**POST** `/auth/token`
 
 使用 API Key 获取 JWT 访问令牌。
 
@@ -102,7 +102,7 @@ Content-Type: application/json
 
 ```json
 {
-  "api_key": "your_api_key_here",
+  "apiKey": "your_api_key_here",
   "model": "glm-4.5-air"
 }
 ```
@@ -111,16 +111,15 @@ Content-Type: application/json
 
 | 字段 | 类型 | 必需 | 默认值 | 描述 |
 |------|------|------|--------|------|
-| api_key | string | 是 | - | 用户的 ZAI API 密钥 |
+| apiKey | string | 是 | - | 用户的 ZAI API 密钥 |
 | model | string | 否 | "glm-4.5-air" | 指定使用的模型 |
 
 #### 响应
 
 ```json
 {
-  "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-  "token_type": "bearer",
-  "expires_in": 86400
+  "accessToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "expiresIn": 86400
 }
 ```
 
@@ -128,9 +127,8 @@ Content-Type: application/json
 
 | 字段 | 类型 | 描述 |
 |------|------|------|
-| access_token | string | JWT 访问令牌 |
-| token_type | string | 令牌类型，固定为 "bearer" |
-| expires_in | number | 令牌有效期（秒），默认 24 小时 |
+| accessToken | string | JWT 访问令牌 |
+| expiresIn | number | 令牌有效期（秒），默认 24 小时 |
 
 #### 状态码
 
@@ -148,7 +146,7 @@ Content-Type: application/json
 #### 请求头
 
 ```
-Authorization: Bearer {access_token}
+Authorization: Bearer {accessToken}
 Content-Type: application/json
 ```
 
@@ -176,7 +174,7 @@ Content-Type: application/json
 #### 请求头
 
 ```
-Authorization: Bearer {access_token}
+Authorization: Bearer {accessToken}
 Content-Type: application/json
 ```
 
@@ -406,15 +404,14 @@ data: {"id":"","object":"chat.completion.chunk","created":0,"model":"","choices"
 
 ```bash
 # 1. 获取访问令牌
-curl -X POST "http://localhost:3000/auth/api-key" \
+curl -X POST "http://localhost:3000/auth/token" \
      -H "Content-Type: application/json" \
-     -d '{"api_key": "your_api_key_here"}'
+     -d '{"apiKey": "your_api_key_here"}'
 
 # 响应示例
 {
-    "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-    "token_type": "bearer",
-    "expires_in": 86400
+    "accessToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+    "expiresIn": 86400
 }
 
 # 2. 使用令牌调用聊天接口
@@ -446,10 +443,10 @@ import json
 
 # 1. 获取访问令牌
 token_response = requests.post(
-    "http://localhost:3000/auth/api-key",
-    json={"api_key": "your_api_key_here"}
+    "http://localhost:3000/auth/token",
+    json={"apiKey": "your_api_key_here"}
 )
-access_token = token_response.json()["access_token"]
+access_token = token_response.json()["accessToken"]
 
 # 2. 聊天完成（流式）
 response = requests.post(
@@ -487,24 +484,24 @@ requests.post(
 
 ```javascript
 // 1. 获取访问令牌
-const tokenResponse = await fetch('http://localhost:3000/auth/api-key', {
+const tokenResponse = await fetch('http://localhost:3000/auth/token', {
   method: 'POST',
   headers: {
     'Content-Type': 'application/json',
   },
   body: JSON.stringify({
-    api_key: 'your_api_key_here'
+    apiKey: 'your_api_key_here'
   })
 });
 
-const { access_token } = await tokenResponse.json();
+const { accessToken } = await tokenResponse.json();
 
 // 2. 聊天完成（流式）
 const response = await fetch('http://localhost:3000/v1/chat/completions', {
   method: 'POST',
   headers: {
     'Content-Type': 'application/json',
-    'Authorization': `Bearer ${access_token}`
+    'Authorization': `Bearer ${accessToken}`
   },
   body: JSON.stringify({
     messages: [
@@ -534,7 +531,7 @@ while (true) {
 await fetch('http://localhost:3000/auth/logout', {
   method: 'POST',
   headers: {
-    'Authorization': `Bearer ${access_token}`
+    'Authorization': `Bearer ${accessToken}`
   }
 });
 ```
