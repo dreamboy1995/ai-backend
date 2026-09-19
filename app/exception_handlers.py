@@ -1,19 +1,20 @@
 from fastapi import Request, HTTPException, status
 from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 import logging
 
 logger = logging.getLogger(__name__)
 
-def request_validation_exception_handler(request: Request, exc: HTTPException):
+def request_validation_exception_handler(request: Request, exc: RequestValidationError):
     """请求参数校验异常处理器"""
-    logger.warning(f"Request validation error: {exc.detail}")
+    logger.warning(f"Request validation error: {exc.errors()}")
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={
             "code": 422,
             "message": "请求参数校验失败",
-            "detail": jsonable_encoder(exc.detail),
+            "detail": jsonable_encoder(exc.errors()),
             "path": request.url.path,
         },
     )

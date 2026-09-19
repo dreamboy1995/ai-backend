@@ -11,7 +11,7 @@
 #### 第 1-2 天（项目初始化 & 骨架搭建）
 | 角色	 | 具体任务（粒度到文件/命令）                                                                                                                                                                                                                                                           | 	验收标准                                                                          |
 |------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------|
-| 后端	 | 1. 初始化项目：`mkdir ai-backend && cd ai-backend`，使用 FastAPI（Python）或 NestJS（TS）。<br>2. 配置 `.env` 文件（`PORT=3000`, `ZAI_API_KEY=xxx`, `JWT_SECRET=xxx`）。<br>3. 编写基础 `main.py` / `app.module.ts`，挂载全局异常过滤器。<br>4. 生成 OpenAPI（Swagger）文档路由（`/docs`）。 | 	服务启动后，浏览器访问 `http://localhost:3000/docs` 能看到 Swagger 页面。|
+| 后端	 | 1. 初始化项目：`mkdir ai-backend && cd ai-backend`，使用 FastAPI（Python）或 NestJS（TS）。<br>2. 配置 `../.env` 文件（`PORT=3000`, `ZAI_API_KEY=xxx`, `JWT_SECRET=xxx`）。<br>3. 编写基础 `main.py` / `app.module.ts`，挂载全局异常过滤器。<br>4. 生成 OpenAPI（Swagger）文档路由（`/docs`）。 | 	服务启动后，浏览器访问 `http://localhost:3000/docs` 能看到 Swagger 页面。|
 | 插件	 | 1. 全局安装 `npm install -g yo generator-code`。<br>2. 生成项目：`yo code`，选择 `TypeScript`，配置 `webview` 模板。<br>3. 安装 UI 依赖：`npm install react @types/react @types/vscode`。<br>4. 编写 `package.json` 的 `contributes.viewsContainers`，将 Webview 注册到侧边栏。                     | 按 `F5` 启动调试，VS Code 侧边栏出现你的插件图标，点击能打开一个空白 Webview 面板。 |
 
 

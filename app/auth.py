@@ -1,9 +1,13 @@
-import jwt
+from jose import jwt, JWTError, ExpiredSignatureError
 from datetime import datetime, timedelta
 from typing import Optional, Dict
 import uuid
-from fastapi import HTTPException, status
-import os
+from fastapi import HTTPException, status, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+import logging
+from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 # 内存存储Token黑名单
 token_blacklist: Dict[str, datetime] = {}
@@ -20,12 +24,8 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     
     to_encode.update({"exp": expire, "iat": datetime.utcnow()})
     to_encode["jti"] = str(uuid.uuid4())  # 添加JWT ID用于黑名单
-    
-    # 从环境变量获取密钥
-    secret_key = os.getenv("JWT_SECRET", "your-secret-key-here")
-    algorithm = os.getenv("JWT_ALGORITHM", "HS256")
-    
-    encoded_jwt = jwt.encode(to_encode, secret_key, algorithm=algorithm)
+
+    encoded_jwt = jwt.encode(to_encode, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
     return encoded_jwt
 
 def verify_token(token: str) -> dict:
@@ -43,12 +43,8 @@ def verify_token(token: str) -> dict:
             else:
                 # 黑名单中的Token已过期，可以移除
                 del token_blacklist[token]
-        
-        # 从环境变量获取密钥
-        secret_key = os.getenv("JWT_SECRET", "your-secret-key-here")
-        algorithm = os.getenv("JWT_ALGORITHM", "HS256")
-        
-        payload = jwt.decode(token, secret_key, algorithms=[algorithm])
+
+        payload = jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
         return payload
         
     except jwt.ExpiredSignatureError:
@@ -84,12 +80,13 @@ def validate_api_key(api_key: str) -> bool:
     # 例如：调用ZAI API的验证接口
     return True
 
-def get_current_user(credentials: str) -> dict:
-    """
-    获取当前用户信息
-    """
+security = HTTPBearer()
+
+
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
+    """获取当前用户（FastAPI 依赖注入）"""
     try:
-        payload = verify_token(credentials)
+        payload = verify_token(credentials.credentials)
         return payload
     except HTTPException:
         raise HTTPException(

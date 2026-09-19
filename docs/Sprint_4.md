@@ -18,7 +18,7 @@
 | 后端/算法 | 1. 初始化 Python 后端项目，安装 tree-sitter 核心库及各语言包：`pip install tree-sitter tree-sitter-python tree-sitter-javascript tree-sitter-typescript tree-sitter-java tree-sitter-go`<br>2. 编写 `parser_factory.py`，实现语言自动检测（根据文件后缀返回对应 Parser）。<br>3. 编写 `ast_parser.py`，输入文件路径，输出符号表（Symbol Table）：<br>  - 类名（Class）、方法/函数名（Function）、全局变量（Variable）。<br>  - 记录每个符号的起始行号、结束行号。<br>4. 编写测试用例：用 `sample.py` 解析，打印出所有函数名和行号范围。 | 运行 `python test_parser.py --file sample.py`，控制台输出：<br>`Function: calculate_sum (Lines 5-12)<br>Function: main (Lines 15-22)<br>Class: DataProcessor (Lines 25-45)` |
 | 插件 | 1. 在 Webview 设置面板中，预留"索引状态"显示区域（如"代码库索引中: 0/150 文件"）。<br>2. 编写 `fileWatcher.ts`，监听 `vscode.workspace.onDidSaveTextDocument` 和 `onDidCreateFiles` 事件，记录变更文件列表（暂不触发后端，等第 37-38 天集成）。 | 当用户保存文件时，插件后台 Console 能打印出 `[File Changed] /path/to/file.py`。 |
 
-⚠️ 注意：`tree-sitter` 的 Python 绑定在不同操作系统上编译可能报错（尤其 Windows）。务必在 `requirements.txt` 中锁死版本（如 `tree-sitter==0.20.4`），并准备 Docker 开发环境统一构建，或使用 `tree-sitter` 官方提供的预编译 `wheel`。
+⚠️ 注意：`tree-sitter` 的 Python 绑定在不同操作系统上编译可能报错（尤其 Windows）。务必在 `../requirements.txt` 中锁死版本（如 `tree-sitter==0.20.4`），并准备 Docker 开发环境统一构建，或使用 `tree-sitter` 官方提供的预编译 `wheel`。
 
 
 #### 第 33-34 天（代码切片 & 语义分块策略）
@@ -102,6 +102,6 @@ interface GlobalState {
 - [ ] 索引完成后，修改一个文件并保存，后端日志显示增量更新成功（旧向量删除，新向量插入）。
 - [ ] 向量搜索 API（`/v1/search?q=排序&top_k=5`）能返回语义相关的函数/类切片（即使关键词不完全匹配）。
 - [ ] 插件中输入 `#`，能弹出符号名下拉列表（UI 交互雏形）。
-- [ ] 索引目录跳过了 `node_modules`、`.git` 等大型无关目录（验证 `.gitignore` 集成逻辑）。
+- [ ] 索引目录跳过了 `node_modules`、`.git` 等大型无关目录（验证 `../.gitignore` 集成逻辑）。
 
 S4 做完后，你的后端就拥有了一个"可查询的代码语义索引库"。虽然用户还感知不到它的存在（因为还没接入 Chat），但它为 S5（混合检索 RAG）和 S6（Inline Chat / 多文件 Diff）铺平了道路。

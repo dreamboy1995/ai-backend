@@ -1,7 +1,7 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from datetime import timedelta
-from auth import create_access_token, verify_token, validate_api_key, add_to_blacklist
+from app.auth import create_access_token, verify_token, validate_api_key, add_to_blacklist
 from pydantic import BaseModel
 from typing import Optional
 
@@ -16,20 +16,6 @@ class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     expires_in: int
-
-def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """
-    获取当前用户
-    """
-    try:
-        payload = verify_token(credentials.credentials)
-        return payload
-    except HTTPException:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="无效的认证凭据",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
 
 @router.post("/auth/api-key", response_model=TokenResponse)
 async def get_api_key_token(request: TokenRequest):
@@ -54,6 +40,24 @@ async def get_api_key_token(request: TokenRequest):
         access_token=access_token,
         expires_in=access_token_expires.seconds
     )
+
+@router.get("/auth/validate")
+async def validate_token(request: Request):
+    """
+    验证当前Token是否有效
+    """
+    auth_header = request.headers.get("authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return {"valid": False, "detail": "缺少认证令牌"}
+
+    token = auth_header[7:]
+    try:
+        payload = verify_token(token)
+        return {"valid": True, "payload": payload}
+    except HTTPException as e:
+        return {"valid": False, "detail": e.detail}
+    except Exception as e:
+        return {"valid": False, "detail": str(e)}
 
 @router.post("/auth/logout")
 async def logout(
