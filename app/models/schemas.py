@@ -14,6 +14,8 @@ class ChatRequest(BaseModel):
     temperature: float = 0.7
     stream: bool = True
     max_tokens: Optional[int] = None
+    # S2 新增：会话 ID，用于多轮对话历史记忆（第 11-12 天）
+    session_id: Optional[str] = None
 
 
 class Delta(BaseModel):

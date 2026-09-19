@@ -182,6 +182,7 @@ Content-Type: application/json
 
 ```json
 {
+  "session_id": "sess_abc123",
   "messages": [
     {
       "role": "user",
@@ -199,11 +200,20 @@ Content-Type: application/json
 
 | 字段 | 类型 | 必需 | 默认值 | 描述 |
 |------|------|------|--------|------|
-| messages | Array[ChatMessage] | 是 | - | 消息列表 |
+| session_id | string | 否 | null | 会话 ID。携带时后端维护多轮对话历史并使用滑动窗口裁剪（保留 System + 最近 5 轮，Token 预算 8000）；不携带时为无状态模式，直接透传 messages |
+| messages | Array[ChatMessage] | 是 | - | 消息列表。携带 session_id 时通常只需传入本次用户提问，后端会自动拼接历史 |
 | model | string | 否 | "glm-4.5-air" | 模型名称 |
 | temperature | number | 否 | 0.7 | 温度参数，控制随机性 |
 | stream | boolean | 否 | true | 是否流式输出 |
 | max_tokens | number | 否 | null | 最大令牌数 |
+
+#### 会话管理说明（S2 第 11-12 天）
+
+- **多轮记忆**：携带 `session_id` 后，后端会将每条用户消息和助手回复存入会话，后续请求自动携带历史上下文。
+- **滑动窗口裁剪**：为避免 Token 无限膨胀，后端始终保留 System 消息 + 最近 5 轮对话（user+assistant），超出部分从最旧消息开始丢弃。
+- **Token 预算**：总预算 8000 tokens，预留 20% 余量（实际 6400 触发裁剪），使用 `tiktoken` 精确计数。
+- **会话过期**：会话默认 1 小时无活动后自动清理（TTL=3600s）。
+- **无状态兼容**：不携带 `session_id` 时，行为与此前完全一致，按请求中的 `messages` 直接透传。
 
 #### ChatMessage 结构
 
