@@ -15,6 +15,7 @@ from app.services.llm import (
 )
 from app.services.session import get_session_service, count_tokens
 from app.services.context_builder import ContextBuilder
+from app.middlewares.request_id import get_request_id, REQUEST_ID_HEADER
 from app.auth import get_current_user
 
 logger = logging.getLogger(__name__)
@@ -246,7 +247,10 @@ async def chat_completions(
                 headers={
                     "Cache-Control": "no-cache",
                     "Connection": "keep-alive",
-                    "Access-Control-Allow-Origin": "*"
+                    "Access-Control-Allow-Origin": "*",
+                    # S2 第 19-20 天：SSE 响应头显式携带 X-Request-ID，
+                    # 便于前端/插件在流式响应中关联后端日志（中间件亦会统一回写）
+                    REQUEST_ID_HEADER: get_request_id(),
                 }
             )
         else:

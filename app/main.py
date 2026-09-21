@@ -9,6 +9,7 @@ from app.logging_config import setup_logging
 from app.config import settings
 from app.lifespan import lifespan
 from app.middlewares.auth import auth_middleware
+from app.middlewares.request_id import request_id_middleware
 from app.exception_handlers import (
     request_validation_exception_handler,
     http_exception_handler,
@@ -53,6 +54,10 @@ def create_app() -> FastAPI:
 
     # JWT 认证中间件
     app.middleware("http")(auth_middleware)
+    # X-Request-ID 链路追踪中间件（S2 第 19-20 天）
+    # 注：app.middleware("http") 后注册的为最外层，故 request_id 先于 auth 执行，
+    # 使 auth 中间件的日志也能带上 request_id。
+    app.middleware("http")(request_id_middleware)
 
     # 全局异常处理器
     app.add_exception_handler(RequestValidationError, request_validation_exception_handler)

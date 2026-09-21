@@ -75,11 +75,44 @@ def test_ttl_expiry():
     print("\n✅ 会话过期(TTL)验证通过")
 
 
+def test_cleanup_expired():
+    """验证主动清理过期会话（S2 第 19-20 天：会话过期机制）。
+
+    内存实现的 TTL 不会像 Redis 那样自动过期，需要后台任务调用
+    cleanup_expired() 主动扫描清理，避免过期会话长期占用内存。
+    """
+    import time
+    svc = SessionService(ttl_seconds=1)
+    svc.create("expired-a")
+    svc.create("expired-b")
+    svc.append("expired-a", {"role": "user", "content": "hi"})
+    svc.append("expired-b", {"role": "user", "content": "hi"})
+
+    # 等待 a/b 过期
+    time.sleep(1.2)
+
+    # 主动清理前，过期会话仍在内存中（未被被动访问触发清理）
+    assert "expired-a" in svc._store, "过期会话应仍驻留内存（等待主动清理）"
+    assert "expired-b" in svc._store
+
+    # 在清理前创建一个未过期会话，验证它不会被误删
+    svc.create("alive-c")
+    svc.append("alive-c", {"role": "user", "content": "hi"})
+
+    removed = svc.cleanup_expired()
+    assert removed >= 2, f"应清理至少 2 个过期会话，实际清理 {removed} 个"
+    assert "expired-a" not in svc._store, "过期会话 expired-a 未被清理"
+    assert "expired-b" not in svc._store, "过期会话 expired-b 未被清理"
+    assert "alive-c" in svc._store, "未过期会话 alive-c 不应被误删"
+    print(f"\n✅ 主动清理过期会话验证通过（清理 {removed} 个，保留未过期会话）")
+
+
 if __name__ == "__main__":
     test_sliding_window_trimming()
     test_system_message_preserved()
     test_token_budget_trimming()
     test_ttl_expiry()
+    test_cleanup_expired()
     print("\n" + "=" * 50)
     print("全部会话管理测试通过！")
     print("=" * 50)

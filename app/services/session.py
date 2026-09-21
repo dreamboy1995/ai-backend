@@ -174,6 +174,38 @@ class SessionService:
                 return False
             return True
 
+    def cleanup_expired(self) -> int:
+        """
+        主动扫描并清理所有已过期的会话（S2 第 19-20 天）。
+
+        内存实现的 TTL 不会自动触发清理（Redis 的 TTL 会在服务端自动过期），
+        因此需要后台任务定期调用本方法，避免过期会话长期占用内存。
+
+        返回：本次清理的会话数量。
+        """
+        removed = 0
+        with self._lock:
+            now = datetime.utcnow()
+            # 先收集过期会话 ID，再逐个删除（避免在迭代中修改字典）
+            expired_ids = [sid for sid, exp in self._expiry.items() if exp <= now]
+            for sid in expired_ids:
+                self._delete_locked(sid)
+                removed += 1
+
+        if removed:
+            logger.info(
+                f"[Session] 主动清理过期会话: 清理 {removed} 个, "
+                f"剩余 {len(self._store)} 个"
+            )
+        else:
+            logger.debug(f"[Session] 主动清理：无过期会话，剩余 {len(self._store)} 个")
+        return removed
+
+    def count(self) -> int:
+        """返回当前（未过期的）会话数量，主要用于监控/调试。"""
+        with self._lock:
+            return len(self._store)
+
     # ------------------------------------------------------------------
     # 滑动窗口裁剪算法
     # ------------------------------------------------------------------

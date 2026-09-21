@@ -15,10 +15,13 @@ class Settings(BaseSettings):
     CORS_ORIGINS: list[str] = ["http://localhost:3000", "http://localhost:5173"]
 
     # 会话管理相关配置（第 11-12 天：后端会话管理 & 历史记忆）
-    SESSION_TTL_SECONDS: int = 3600       # 会话过期时间，默认 1 小时
+    SESSION_TTL_SECONDS: int = 3600       # 会话过期时间，默认 1 小时（S2 第 19-20 天要求 TTL=1 小时）
     SESSION_TOKEN_BUDGET: int = 8000      # 总 Token 预算（为模型预留余量）
     SESSION_TOKEN_MARGIN: float = 0.2     # Token 余量比例，触发裁剪阈值 = budget * (1 - margin)
     SESSION_MAX_ROUNDS: int = 5           # 保留的最近对话轮数（1 轮 = user + assistant）
+    # 主动清理过期会话的后台任务执行间隔（S2 第 19-20 天：会话过期机制）
+    # 内存实现不像 Redis 那样自动过期，需要定期扫描清理，避免过期会话占用内存
+    SESSION_CLEANUP_INTERVAL_SECONDS: int = 300
 
     # 上下文拼装相关配置（第 15-16 天：后端上下文拼装 & 系统提示词工程）
     SESSION_CONTEXT_TOKEN_RATIO: float = 0.5  # 上下文（System Prompt + 文件内容）占用 Token 阈值的比例
