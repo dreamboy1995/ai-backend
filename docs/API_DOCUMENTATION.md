@@ -373,7 +373,76 @@ data: {"id":"","object":"chat.completion.chunk","created":0,"model":"","choices"
 
 ---
 
-### 6. 测试接口
+### 6. 用户用量查询（S3 第 21-22 天新增）
+
+**GET** `/v1/user/usage`
+
+查询当前用户今日 Token 消耗量与配额信息。需要 JWT 认证。此接口不受限频限制（状态查询接口）。
+
+#### 请求头
+
+```
+Authorization: Bearer {accessToken}
+```
+
+#### 响应
+
+```json
+{
+  "user_id": "a1b2c3d4e5f6...",
+  "used_tokens_today": 12500,
+  "quota_limit_per_day": 100000,
+  "percentage": 0.125,
+  "reset_at": "2026-09-23T00:00:00Z"
+}
+```
+
+#### 字段说明
+
+| 字段 | 类型 | 描述 |
+|------|------|------|
+| user_id | string | 用户标识（JWT sub 字段的 SHA256 哈希，避免原始 API Key 暴露） |
+| used_tokens_today | number | 今日已消耗 Token 数（每次聊天完成后累加） |
+| quota_limit_per_day | number | 每日 Token 配额上限（默认 100000） |
+| percentage | number | 已用比例（0.0 ~ 1.0） |
+| reset_at | string | 配额重置时间（ISO 8601，UTC 午夜） |
+
+#### 状态码
+
+- `200`: 查询成功
+- `401`: 未认证或令牌无效
+
+#### 限频说明（S3 第 21-22 天）
+
+后端对所有 `/v1/` 前缀的业务接口实施滑动窗口限频（`/v1/user/usage` 除外）：
+
+| 限制维度 | 限制值 | 说明 |
+|----------|--------|------|
+| 每分钟 | 20 次 | 按 user_id（JWT sub 字段哈希）限频 |
+| 每天 | 500 次 | 按 user_id 限频 |
+
+超限时返回 HTTP 429，并在 Response Header 中携带：
+
+| Header | 说明 |
+|--------|------|
+| X-RateLimit-Reset | 剩余重置秒数 |
+| X-RateLimit-Remaining | 剩余请求数 |
+| X-RateLimit-Limit | 当前窗口的请求上限 |
+| Retry-After | 建议重试等待秒数（同 X-RateLimit-Reset） |
+
+#### 限频响应
+
+```json
+{
+  "code": 429,
+  "message": "请求频率超限，请稍后再试",
+  "path": "/v1/chat/completions"
+}
+```
+
+---
+
+### 7. 测试接口
 
 #### 6.1 测试业务异常
 

@@ -15,6 +15,7 @@ from app.services.llm import (
 )
 from app.services.session import get_session_service, count_tokens
 from app.services.context_builder import ContextBuilder
+from app.services.quota import get_quota_service
 from app.middlewares.request_id import get_request_id, REQUEST_ID_HEADER
 from app.auth import get_current_user
 
@@ -218,6 +219,22 @@ async def chat_completions(
                         logger.info(
                             f"[Chat] 助手回复已写入会话: session_id={session_id}, "
                             f"内容长度={len(full_content)}"
+                        )
+
+                    # S3 第 21-22 天：记录用户 Token 消耗量
+                    # 流式响应通常不返回 usage，使用 tiktoken 估算
+                    # 输入 Token = 发送给模型的消息列表
+                    input_tokens = count_tokens(llm_messages)
+                    # 输出 Token = 助手回复内容
+                    output_content = "".join(assistant_content_parts) if assistant_content_parts else ""
+                    output_tokens = count_tokens([{"role": "assistant", "content": output_content}])
+                    total_tokens = input_tokens + output_tokens
+                    if total_tokens > 0:
+                        get_quota_service().record_usage(api_key, total_tokens)
+                        logger.info(
+                            f"[Chat] Token 用量已记录: user={api_key[:8]}..., "
+                            f"input={input_tokens}, output={output_tokens}, "
+                            f"total={total_tokens}"
                         )
                 except ZAIRateLimitError as e:
                     logger.warning(f"Rate limit error: {e.message}")

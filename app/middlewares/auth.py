@@ -38,7 +38,11 @@ async def auth_middleware(request: Request, call_next):
     token = auth_header[7:]
 
     try:
-        verify_token(token)
+        payload = verify_token(token)
+        # S3 第 21-22 天：将解码后的 JWT payload 存入 request.state，
+        # 供限频中间件（rate_limiter）读取 user_id（sub 字段）。
+        # 限频中间件在本中间件之后执行（注册顺序更内层）。
+        request.state.user_payload = payload
     except Exception as e:
         # 中间件内异常需自行处理，全局异常处理器对中间件不生效
         logger.warning(f"Token verification failed: {e}")

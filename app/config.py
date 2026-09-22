@@ -27,6 +27,18 @@ class Settings(BaseSettings):
     SESSION_CONTEXT_TOKEN_RATIO: float = 0.5  # 上下文（System Prompt + 文件内容）占用 Token 阈值的比例
     # 上下文预算 = 阈值(6400) * 0.5 = 3200，剩余 3200 留给对话历史
 
+    # Redis 配置（S3 第 21-22 天：限频与配额系统）
+    # 未配置 Redis 时自动降级为内存实现（与 SessionService 一致的降级策略）
+    REDIS_URL: str = "redis://localhost:6379/0"
+    REDIS_ENABLED: bool = False  # 默认关闭，设为 True 时启用 Redis
+
+    # 限频配置（S3 第 21-22 天：按 user_id 滑动窗口限频）
+    RATE_LIMIT_PER_MINUTE: int = 20   # 每分钟请求上限
+    RATE_LIMIT_PER_DAY: int = 500     # 每天请求上限
+
+    # 配额配置（S3 第 21-22 天：每日 Token 消耗配额）
+    QUOTA_LIMIT_PER_DAY: int = 100000  # 每日 Token 配额上限
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
