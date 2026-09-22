@@ -10,6 +10,13 @@ class Settings(BaseSettings):
     ZAI_API_KEY: str  # 必填，无默认值，缺失时 Pydantic 启动即报错
     JWT_SECRET: str  # 必填，无默认值
     JWT_ALGORITHM: str = "HS256"
+
+    # S3 第 23-24 天：多厂商适配器 API Key
+    # 各厂商 Key 可选配置；未配置的厂商对应模型仍会在 /v1/models 返回，
+    # 但实际调用时会返回服务不可用错误
+    DEEPSEEK_API_KEY: str = ""
+    OPENAI_API_KEY: str = ""
+    ANTHROPIC_API_KEY: str = ""
     ENVIRONMENT: str = "development"
     RELOAD: bool = False
     CORS_ORIGINS: list[str] = ["http://localhost:3000", "http://localhost:5173"]

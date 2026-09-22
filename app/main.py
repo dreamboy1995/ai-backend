@@ -22,6 +22,7 @@ from app.api.files import router as files_router
 from app.api.search import router as search_router
 from app.api.terminal import router as terminal_router
 from app.api.user import router as user_router
+from app.api.models import router as models_router
 
 # 日志配置必须在所有日志调用之前执行
 setup_logging()
@@ -82,6 +83,8 @@ def create_app() -> FastAPI:
     app.include_router(terminal_router, prefix="/v1/terminal", tags=["终端"])
     # S3 第 21-22 天：用户用量查询接口
     app.include_router(user_router, prefix="/v1", tags=["用户"])
+    # S3 第 23-24 天：模型列表接口
+    app.include_router(models_router, prefix="/v1", tags=["模型"])
 
     # 基础路由
     @app.get("/", tags=["默认"])

@@ -5,13 +5,14 @@ from fastapi.responses import StreamingResponse
 from typing import Dict, List, Optional
 from app.models.schemas import ChatRequest, ChatChunk, ContextItem
 from app.services.llm import (
-    ZAIAdapter,
-    ZAIAdapterError,
-    ZAIRateLimitError,
-    ZAITokenTooLongError,
-    ZAITimeoutError,
-    ZAINetworkError,
-    ZAIServiceError,
+    AdapterFactory,
+    AdapterError,
+    AdapterRateLimitError,
+    AdapterTokenTooLongError,
+    AdapterTimeoutError,
+    AdapterNetworkError,
+    AdapterServiceError,
+    DEFAULT_MODEL,
 )
 from app.services.session import get_session_service, count_tokens
 from app.services.context_builder import ContextBuilder
@@ -23,9 +24,6 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# 每个用户的适配器实例缓存
-_zai_adapters: Dict[str, ZAIAdapter] = {}
-
 # ContextBuilder 单例（无状态配置，全局共享）
 _context_builder: Optional[ContextBuilder] = None
 
@@ -36,13 +34,6 @@ def get_context_builder() -> ContextBuilder:
     if _context_builder is None:
         _context_builder = ContextBuilder()
     return _context_builder
-
-
-def get_zai_adapter_for_user(api_key) -> ZAIAdapter:
-    """为指定用户获取或创建ZAI适配器实例"""
-    if api_key not in _zai_adapters:
-        _zai_adapters[api_key] = ZAIAdapter(api_key=api_key)
-    return _zai_adapters[api_key]
 
 
 def _extract_system_content(messages: List[dict]) -> tuple:
@@ -75,7 +66,7 @@ async def chat_completions(
     - 系统提示词 Token 纳入裁剪预算，保证总 Token 不超限。
     - 超长上下文按优先级丢弃：file/selection（用户主动 @）保留，implicit（自动附带）可截断。
     """
-    # 从JWT token中提取用户提交的API key
+    # 从JWT token中提取用户标识（用于限频、配额等用户级统计）
     api_key = current_user.get("sub")
     if not api_key:
         raise HTTPException(
@@ -83,14 +74,20 @@ async def chat_completions(
             detail="未找到API Key，请重新登录"
         )
 
-    zai_adapter = get_zai_adapter_for_user(api_key)
-
     # 验证请求参数
     if not request.messages:
         raise HTTPException(
             status_code=400,
             detail="Messages are required"
         )
+
+    # S3 第 23-24 天：根据 model 字段动态路由到对应厂商适配器
+    model_id = request.model or DEFAULT_MODEL
+    try:
+        adapter = AdapterFactory.get_adapter(model_id)
+    except AdapterServiceError as e:
+        logger.warning(f"[Chat] 适配器创建失败: model={model_id}, msg={e.message}")
+        raise HTTPException(status_code=503, detail=e.message)
 
     # session_id 需提前赋值，供上下文处理日志和会话管理共同使用
     session_id = request.session_id
@@ -175,19 +172,27 @@ async def chat_completions(
 
     try:
         # 构建适配器需要的参数
+        # S3 关键技术预研：max_tokens 普通对话默认 4096，/new 请求由插件传 8192+
         adapter_params = {
             "messages": llm_messages,
-            "model": request.model or "glm-4.5-air",
-            "temperature": request.temperature or 0.7,
-            "stream": request.stream or True
+            "model": model_id,
+            "temperature": request.temperature if request.temperature is not None else 0.7,
+            "stream": request.stream if request.stream is not None else True,
+            "max_tokens": request.max_tokens or 4096,
         }
+
+        logger.info(
+            f"[Chat] 使用模型: model={model_id}, "
+            f"temperature={adapter_params['temperature']}, "
+            f"max_tokens={adapter_params['max_tokens']}"
+        )
 
         # 如果是流式请求，返回StreamingResponse
         if request.stream:
             async def generate_stream():
                 assistant_content_parts: List[str] = []
                 try:
-                    async for chunk in zai_adapter.chat_completion(**adapter_params):
+                    async for chunk in adapter.chat_completion(**adapter_params):
                         # 收集助手回复内容，用于后续写入会话历史
                         choices = chunk.get("choices", [])
                         if choices:
@@ -236,22 +241,22 @@ async def chat_completions(
                             f"input={input_tokens}, output={output_tokens}, "
                             f"total={total_tokens}"
                         )
-                except ZAIRateLimitError as e:
+                except AdapterRateLimitError as e:
                     logger.warning(f"Rate limit error: {e.message}")
                     yield f'data: {{"error": {{"code": {e.code}, "msg": "{e.message}"}}}}\n\n'
-                except ZAITokenTooLongError as e:
+                except AdapterTokenTooLongError as e:
                     logger.warning(f"Token too long error: {e.message}")
                     yield f'data: {{"error": {{"code": {e.code}, "msg": "{e.message}"}}}}\n\n'
-                except ZAITimeoutError as e:
+                except AdapterTimeoutError as e:
                     logger.warning(f"Timeout error: {e.message}")
                     yield f'data: {{"error": {{"code": {e.code}, "msg": "{e.message}"}}}}\n\n'
-                except ZAINetworkError as e:
+                except AdapterNetworkError as e:
                     logger.warning(f"Network error: {e.message}")
                     yield f'data: {{"error": {{"code": {e.code}, "msg": "{e.message}"}}}}\n\n'
-                except ZAIServiceError as e:
+                except AdapterServiceError as e:
                     logger.warning(f"Service error: {e.message}")
                     yield f'data: {{"error": {{"code": {e.code}, "msg": "{e.message}"}}}}\n\n'
-                except ZAIAdapterError as e:
+                except AdapterError as e:
                     logger.warning(f"Adapter error: {e.message}")
                     yield f'data: {{"error": {{"code": {e.code}, "msg": "{e.message}"}}}}\n\n'
                 except Exception as e:
@@ -289,7 +294,4 @@ async def chat_completions(
 @router.on_event("shutdown")
 async def shutdown_event():
     """应用关闭时清理适配器"""
-    global _zai_adapters
-    for adapter in _zai_adapters.values():
-        await adapter.close()
-    _zai_adapters.clear()
+    await AdapterFactory.close_all()
