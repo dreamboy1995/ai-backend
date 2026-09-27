@@ -19,6 +19,7 @@ from app.services.context_builder import ContextBuilder
 from app.services.quota import get_quota_service
 from app.middlewares.request_id import get_request_id, REQUEST_ID_HEADER
 from app.auth import get_current_user
+from app.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +66,11 @@ async def chat_completions(
       <context_files><file path="main.py" lang="python">...</file></context_files>
     - 系统提示词 Token 纳入裁剪预算，保证总 Token 不超限。
     - 超长上下文按优先级丢弃：file/selection（用户主动 @）保留，implicit（自动附带）可截断。
+
+    支持请求模式（S3 第 28-29 天）：
+    - mode="chat"（默认）：普通对话，60s 超时，默认 max_tokens=4096。
+    - mode="new"：单文件生成（/new 指令），120s 超时，默认 max_tokens=8192，
+      因为完整文件生成比对话需要更多推理时间。
     """
     # 从JWT token中提取用户标识（用于限频、配额等用户级统计）
     api_key = current_user.get("sub")
@@ -172,19 +178,31 @@ async def chat_completions(
 
     try:
         # 构建适配器需要的参数
-        # S3 关键技术预研：max_tokens 普通对话默认 4096，/new 请求由插件传 8192+
+        # S3 第 28-29 天：根据请求模式区分超时与 max_tokens
+        # - chat 模式：60s 超时，默认 max_tokens=4096
+        # - new  模式：120s 超时，默认 max_tokens=8192（单文件生成需要更多推理时间）
+        is_new_mode = request.mode == "new"
+        request_timeout = (
+            settings.NEW_FILE_TIMEOUT_SECONDS if is_new_mode else settings.CHAT_TIMEOUT_SECONDS
+        )
+        default_max_tokens = (
+            settings.NEW_FILE_MAX_TOKENS if is_new_mode else settings.CHAT_MAX_TOKENS
+        )
+
         adapter_params = {
             "messages": llm_messages,
             "model": model_id,
             "temperature": request.temperature if request.temperature is not None else 0.7,
             "stream": request.stream if request.stream is not None else True,
-            "max_tokens": request.max_tokens or 4096,
+            "max_tokens": request.max_tokens or default_max_tokens,
+            "timeout": request_timeout,
         }
 
         logger.info(
-            f"[Chat] 使用模型: model={model_id}, "
+            f"[Chat] 使用模型: model={model_id}, mode={request.mode}, "
             f"temperature={adapter_params['temperature']}, "
-            f"max_tokens={adapter_params['max_tokens']}"
+            f"max_tokens={adapter_params['max_tokens']}, "
+            f"timeout={request_timeout}s"
         )
 
         # 如果是流式请求，返回StreamingResponse

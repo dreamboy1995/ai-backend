@@ -46,6 +46,14 @@ class Settings(BaseSettings):
     # 配额配置（S3 第 21-22 天：每日 Token 消耗配额）
     QUOTA_LIMIT_PER_DAY: int = 100000  # 每日 Token 配额上限
 
+    # S3 第 28-29 天：请求超时与 max_tokens 配置
+    # 普通对话（chat 模式）使用较短超时，单文件生成（new 模式）使用更长超时，
+    # 因为完整文件生成往往比对话需要更多推理时间。
+    CHAT_TIMEOUT_SECONDS: float = 60.0       # 普通对话超时（秒）
+    NEW_FILE_TIMEOUT_SECONDS: float = 120.0  # /new 单文件生成超时（秒）
+    CHAT_MAX_TOKENS: int = 4096              # 普通对话默认 max_tokens
+    NEW_FILE_MAX_TOKENS: int = 8192          # /new 单文件生成默认 max_tokens
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

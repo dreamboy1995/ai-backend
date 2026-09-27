@@ -55,6 +55,11 @@ class ChatRequest(BaseModel):
     # S2 第 13-14 天新增：上下文数组，承载 @文件 / @选中代码 / 隐式上下文。
     # ContextBuilder 会消费此字段拼装 System Prompt（第 15-16 天已实现）。
     contexts: Optional[List[ContextItem]] = None
+    # S3 第 28-29 天新增：请求模式。
+    # - "chat": 普通对话，使用 60s 超时、默认 max_tokens=4096。
+    # - "new":  单文件生成（/new 指令），使用 120s 超时、默认 max_tokens=8192，
+    #           因为完整文件生成比对话需要更多推理时间。
+    mode: Literal["chat", "new"] = "chat"
 
 
 class Delta(BaseModel):

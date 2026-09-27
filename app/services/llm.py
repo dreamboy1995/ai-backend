@@ -138,11 +138,15 @@ class BaseAdapter:
         model: str,
         temperature: float = 0.7,
         stream: bool = True,
+        timeout: Optional[float] = None,
         **kwargs
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """
         调用厂商 API 并返回流式响应（OpenAI 兼容格式）。
         子类必须实现此方法。
+
+        - timeout: 本次请求的超时时间（秒）。为 None 时使用客户端默认超时。
+                   S3 第 28-29 天：/new 模式传 120s，普通 chat 模式传 60s。
         """
         raise NotImplementedError
 
@@ -173,11 +177,14 @@ class OpenAICompatibleAdapter(BaseAdapter):
         model: str,
         temperature: float = 0.7,
         stream: bool = True,
+        timeout: Optional[float] = None,
         **kwargs
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """
         调用 OpenAI 兼容 API 并返回流式响应。
         将厂商返回格式转换为 OpenAI 兼容 chunk 格式。
+
+        - timeout: 本次请求的超时时间（秒），为 None 时使用客户端默认超时。
         """
         request_id = str(uuid.uuid4())
 
@@ -189,12 +196,19 @@ class OpenAICompatibleAdapter(BaseAdapter):
             **kwargs,
         }
 
+        # S3 第 28-29 天：支持按请求覆盖超时（/new 模式 120s，chat 模式 60s）
+        # timeout 为 None 时不传，使用客户端默认超时
+        stream_extra: Dict[str, Any] = {}
+        if timeout is not None:
+            stream_extra["timeout"] = httpx.Timeout(timeout)
+
         try:
             async with self.client.stream(
                 "POST",
                 self._get_endpoint(),
                 json=payload,
-                headers={"Accept": "text/event-stream"}
+                headers={"Accept": "text/event-stream"},
+                **stream_extra
             ) as response:
                 # 检查 HTTP 状态码，抛出对应异常
                 if response.status_code == 429:
@@ -350,10 +364,13 @@ class AnthropicAdapter(BaseAdapter):
         model: str,
         temperature: float = 0.7,
         stream: bool = True,
+        timeout: Optional[float] = None,
         **kwargs
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """
         调用 Anthropic API 并返回 OpenAI 兼容的流式 chunk。
+
+        - timeout: 本次请求的超时时间（秒），为 None 时使用客户端默认超时。
         """
         request_id = str(uuid.uuid4())
 
@@ -375,12 +392,18 @@ class AnthropicAdapter(BaseAdapter):
         if system_content:
             payload["system"] = system_content
 
+        # S3 第 28-29 天：支持按请求覆盖超时
+        stream_extra: Dict[str, Any] = {}
+        if timeout is not None:
+            stream_extra["timeout"] = httpx.Timeout(timeout)
+
         try:
             async with self.client.stream(
                 "POST",
                 f"{self.base_url}/v1/messages",
                 json=payload,
-                headers={"Accept": "text/event-stream"}
+                headers={"Accept": "text/event-stream"},
+                **stream_extra
             ) as response:
                 if response.status_code == 429:
                     raise AdapterRateLimitError("模型调用频率超限")
