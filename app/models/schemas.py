@@ -3,6 +3,45 @@ from pydantic import BaseModel, Field, field_validator
 import time
 
 
+# ============================================================
+# S4 第 31-32 天：代码索引接口数据结构
+# ============================================================
+
+class IndexStartRequest(BaseModel):
+    """触发全量索引请求"""
+    workspace_root: str = Field(..., min_length=1, description="工作区根路径")
+    force_rebuild: bool = Field(default=False, description="是否强制重建索引")
+
+
+class IndexStartResponse(BaseModel):
+    """触发全量索引响应"""
+    job_id: str
+    total_files: int
+
+
+class IndexStatusResponse(BaseModel):
+    """查询索引进度响应"""
+    status: Literal["idle", "indexing", "done", "error"]
+    total: int = 0
+    processed: int = 0
+    percentage: float = 0.0
+    total_symbols: int = 0
+    message: Optional[str] = None
+
+
+class IndexUpdateRequest(BaseModel):
+    """增量更新通知请求（由插件在文件保存时调用）"""
+    file_path: str = Field(..., min_length=1, description="变更的文件路径（相对路径）")
+    action: Literal["modified", "deleted", "renamed"]
+
+
+class IndexUpdateResponse(BaseModel):
+    """增量更新响应"""
+    success: bool
+    message: str
+    symbols_count: int = 0
+
+
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant"]
     content: str

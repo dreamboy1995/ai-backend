@@ -7,3 +7,13 @@ python-multipart
 httpx
 tiktoken
 redis
+# S4 第 31-32 天：tree-sitter 多语言 AST 解析
+# 注意：使用 tree-sitter>=0.21 配合 tree-sitter-* 语言包可直接使用预编译 grammar，
+# 避免 0.20.x 版本在 Windows 上需要 C 编译（Language.build_library）的坑。
+# 代码兼容 0.21-0.24（language 直接为 Language 对象）和 0.25+（language() 返回 PyCapsule）。
+tree-sitter>=0.21.3
+tree-sitter-python
+tree-sitter-javascript
+tree-sitter-typescript
+tree-sitter-java
+tree-sitter-go
