@@ -6,3 +6,5 @@ __pycache__/
 .DS_Store
 .aider*
 .env
+# S4 代码索引：本地向量库、Embedding 缓存、索引标记文件
+.ai_index/

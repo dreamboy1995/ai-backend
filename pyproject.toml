@@ -3,6 +3,24 @@ name = "ai-backend"
 version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = [
+    "fastapi>=0.142.2",
     "httpx>=0.28.1",
+    "lancedb>=0.10.0",
+    "numpy>=2.2.6",
+    "pyarrow>=16.0.0",
+    "pydantic-settings>=2.15.0",
     "pyjwt>=2.14.0",
+    "python-dotenv>=1.2.4",
+    "python-jose[cryptography]>=3.5.0",
+    "python-multipart>=0.0.32",
+    "redis>=8.1.0",
+    "sentence-transformers>=2.2.0",
+    "tiktoken>=0.14.0",
+    "tree-sitter>=0.21.3",
+    "tree-sitter-go>=0.25.0",
+    "tree-sitter-java>=0.23.5",
+    "tree-sitter-javascript>=0.25.0",
+    "tree-sitter-python>=0.25.0",
+    "tree-sitter-typescript>=0.23.2",
+    "uvicorn[standard]>=0.54.0",
 ]

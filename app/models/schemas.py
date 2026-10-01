@@ -11,6 +11,13 @@ class IndexStartRequest(BaseModel):
     """触发全量索引请求"""
     workspace_root: str = Field(..., min_length=1, description="工作区根路径")
     force_rebuild: bool = Field(default=False, description="是否强制重建索引")
+    priority_files: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "优先索引的文件列表（相对路径），如用户当前打开的文件。"
+            "实现'即用即索引'策略：优先处理这些文件后，后台静默索引剩余文件。"
+        )
+    )
 
 
 class IndexStartResponse(BaseModel):
@@ -24,7 +31,7 @@ class IndexStatusResponse(BaseModel):
     status: Literal["idle", "indexing", "done", "error"]
     total: int = 0
     processed: int = 0
-    percentage: float = 0.0
+    percentage: float = 0.0  # 进度比例，0.0 ~ 1.0（前端展示时 * 100 转百分比）
     total_symbols: int = 0
     message: Optional[str] = None
 

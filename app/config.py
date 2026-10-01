@@ -79,6 +79,16 @@ class Settings(BaseSettings):
     # 向量搜索默认返回 top_k
     VECTOR_SEARCH_TOP_K: int = 10
 
+    # S4 第 37-38 天：全量索引 & 增量更新机制
+    # 每处理多少个文件后批量提交向量（切片→向量化→删旧→插新），减少 IO 开销
+    INDEX_BATCH_SIZE: int = 10
+    # Redis 中索引进度 key 的前缀（完整 key = {prefix}:{job_id}）
+    INDEX_REDIS_KEY_PREFIX: str = "index:status"
+    # 索引进度在 Redis 中的过期时间（秒）
+    INDEX_REDIS_TTL: int = 3600
+    # 索引完成标记文件路径（相对工作区根目录），供插件检测当前仓库是否已索引
+    INDEX_MARKER_FILE: str = ".ai_index/index_done"
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

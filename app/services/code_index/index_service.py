@@ -1,5 +1,5 @@
 """
-索引服务（S4 第 31-36 天）
+索引服务（S4 第 31-38 天）
 
 管理代码库索引的状态与流程。
 
@@ -7,8 +7,15 @@
 第 33-34 天：语义切片 + 向量化（EmbeddingClient）。
 第 35-36 天：接入 LanceDB 向量数据库，索引时将切片写入向量库，
             支持按向量检索与按文件删除（增量更新）。
+第 37-38 天：全仓库首次索引 & 增量更新机制
+            - 后台线程异步执行全量索引，HTTP 接口立即返回 job_id
+            - 每 INDEX_BATCH_SIZE 个文件批量提交向量（切片→向量化→删旧→插新）
+            - 索引进度写入 Redis（供插件轮询展示），Redis 不可用时降级为内存
+            - "即用即索引"策略：priority_files 优先处理，后台静默索引剩余文件
+            - 索引完成后写入 .ai_index 标记文件，供插件检测仓库是否已索引
 """
 
+import json
 import logging
 import os
 import threading
@@ -20,7 +27,7 @@ from typing import Dict, List, Optional
 from .ast_parser import parse_file
 from .code_chunker import chunk_file
 from .embedding_client import get_embedding_client
-from .models import SymbolTable
+from .models import CodeChunk, SymbolTable
 from .parser_factory import is_supported
 from .vector_store import get_vector_store
 
@@ -32,15 +39,49 @@ SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "bu
 MAX_FILE_SIZE = 1024 * 1024
 
 
+def _get_batch_size() -> int:
+    """从配置读取批量提交大小（延迟导入避免循环依赖）"""
+    try:
+        from app.config import settings
+        return settings.INDEX_BATCH_SIZE
+    except Exception:
+        return 10
+
+
+def _get_redis_key_prefix() -> str:
+    try:
+        from app.config import settings
+        return settings.INDEX_REDIS_KEY_PREFIX
+    except Exception:
+        return "index:status"
+
+
+def _get_redis_ttl() -> int:
+    try:
+        from app.config import settings
+        return settings.INDEX_REDIS_TTL
+    except Exception:
+        return 3600
+
+
+def _get_marker_file() -> str:
+    try:
+        from app.config import settings
+        return settings.INDEX_MARKER_FILE
+    except Exception:
+        return ".ai_index/index_done"
+
+
 class IndexService:
     """
-    索引服务单例，管理全量/增量索引状态。
+    索引服务单例，管理全量/增量索引状态与流程。
 
     状态字段：
     - status: idle / indexing / done / error
     - total: 待处理文件总数
     - processed: 已处理文件数
     - total_symbols: 已索引的符号总数
+    - workspace_root: 当前索引的工作区根路径（供增量更新复用）
     """
 
     def __init__(self):
@@ -51,20 +92,56 @@ class IndexService:
         self.total_symbols: int = 0
         self.message: Optional[str] = None
         self.job_id: Optional[str] = None
+        self.workspace_root: Optional[str] = None
+        # 后台索引线程
+        self._index_thread: Optional[threading.Thread] = None
         # file_path(相对路径) -> SymbolTable 的内存索引
         self._index: Dict[str, SymbolTable] = {}
 
+    # ============================================================
+    # 状态查询
+    # ============================================================
+
     def get_status(self) -> dict:
         with self._lock:
-            percentage = (self.processed / self.total * 100) if self.total > 0 else 0.0
+            # 数据契约：percentage 为 0~1 的小数（与 quota.py 的 percentage 语义一致），
+            # 前端展示时自行 * 100 转为百分比。
+            percentage = (self.processed / self.total) if self.total > 0 else 0.0
             return {
                 "status": self.status,
                 "total": self.total,
                 "processed": self.processed,
-                "percentage": round(percentage, 1),
+                "percentage": round(percentage, 4),
                 "total_symbols": self.total_symbols,
                 "message": self.message,
+                "workspace_root": self.workspace_root,
             }
+
+    def get_status_from_redis(self) -> Optional[dict]:
+        """
+        从 Redis 读取最新索引进度。
+
+        优先返回 Redis 中的状态（多进程/多实例场景下更准确），
+        Redis 不可用时返回 None，由调用方降级到内存 get_status()。
+        """
+        job_id = self.job_id
+        if not job_id:
+            return None
+        try:
+            from app.services.redis_client import get_redis_sync
+            r = get_redis_sync()
+            if r is None:
+                return None
+            raw = r.get(f"{_get_redis_key_prefix()}:{job_id}")
+            if raw:
+                return json.loads(raw)
+        except Exception as e:
+            logger.debug(f"[IndexService] 从 Redis 读取进度失败: {e}")
+        return None
+
+    # ============================================================
+    # 文件扫描
+    # ============================================================
 
     def _scan_files(self, workspace_root: str) -> List[str]:
         """扫描工作区，返回待索引的文件相对路径列表"""
@@ -92,25 +169,96 @@ class IndexService:
 
         return files
 
-    def start_index(self, workspace_root: str, force_rebuild: bool = False) -> dict:
-        """
-        启动全量索引（同步执行，便于第 31-36 天验收）。
+    # ============================================================
+    # 全量索引（后台线程）
+    # ============================================================
 
-        第 37-38 天将改为后台线程 + 进度写入 Redis。
+    def start_index(
+        self,
+        workspace_root: str,
+        force_rebuild: bool = False,
+        priority_files: Optional[List[str]] = None,
+    ) -> dict:
+        """
+        启动全量索引（后台线程异步执行）。
+
+        第 37-38 天改造：
+        - 立即返回 job_id 与 total_files，不阻塞 HTTP 请求
+        - 后台线程执行扫描→解析→切片→批量向量化→批量写入
+        - priority_files 优先处理（即用即索引策略）
+
+        Args:
+            workspace_root: 工作区根路径
+            force_rebuild: 是否强制重建（清空已有索引与向量库）
+            priority_files: 优先索引的文件列表（相对路径），如用户当前打开的文件
+
+        Returns:
+            {"job_id": ..., "total_files": ...}
         """
         with self._lock:
             if self.status == "indexing":
-                return {"job_id": self.job_id, "total_files": self.total, "message": "索引正在进行中"}
+                return {
+                    "job_id": self.job_id,
+                    "total_files": self.total,
+                    "message": "索引正在进行中",
+                }
 
             self.job_id = str(uuid.uuid4())
             self.status = "indexing"
             self.processed = 0
             self.total_symbols = 0
             self.message = None
+            self.workspace_root = workspace_root
             if force_rebuild:
                 self._index.clear()
 
-        # S4 第 35-36 天：初始化向量库（按 Embedding 维度建表；force_rebuild 时清空）
+        # 前台快速扫描文件列表，用于立即返回 total_files
+        # （扫描本身不做解析/向量化，对 100 文件仓库通常 < 1s）
+        try:
+            files = self._scan_files(workspace_root)
+        except ValueError:
+            with self._lock:
+                self.status = "error"
+                self.message = f"工作区路径不存在: {workspace_root}"
+            raise
+
+        with self._lock:
+            self.total = len(files)
+
+        # 启动后台线程执行索引
+        self._index_thread = threading.Thread(
+            target=self._run_index,
+            args=(workspace_root, files, force_rebuild, priority_files),
+            daemon=True,
+            name=f"index-worker-{self.job_id[:8]}",
+        )
+        self._index_thread.start()
+
+        logger.info(
+            f"[IndexService] 索引任务已启动 job_id={self.job_id} "
+            f"total_files={self.total} priority={len(priority_files or [])}"
+        )
+        return {"job_id": self.job_id, "total_files": self.total}
+
+    def _run_index(
+        self,
+        workspace_root: str,
+        files: List[str],
+        force_rebuild: bool,
+        priority_files: Optional[List[str]],
+    ) -> None:
+        """
+        后台线程：执行全量索引流程。
+
+        流程：
+        1. 初始化向量库（按维度建表；force_rebuild 时清空）
+        2. 重排文件：priority_files 优先（即用即索引）
+        3. 逐文件解析→切片，收集到批次缓冲区
+        4. 每 INDEX_BATCH_SIZE 个文件批量向量化→删旧→批量写入
+        5. 更新进度到 Redis
+        6. 完成后写入标记文件
+        """
+        # 1. 初始化向量库
         vector_store = get_vector_store()
         try:
             embed_client = get_embedding_client()
@@ -120,81 +268,200 @@ class IndexService:
         except Exception as e:
             logger.warning(f"[IndexService] 向量库初始化失败，索引将跳过向量化: {e}")
 
-        try:
-            files = self._scan_files(workspace_root)
-            with self._lock:
-                self.total = len(files)
+        # 2. 重排文件：priority_files 优先
+        ordered_files = self._reorder_priority(files, priority_files)
+        logger.info(f"[IndexService] 开始索引 {len(ordered_files)} 个文件")
 
-            for rel_path in files:
-                full_path = os.path.join(workspace_root, rel_path)
-                try:
-                    table = parse_file(full_path)
-                    # 统一使用相对路径存储
-                    table.file_path = rel_path
-                    with self._lock:
-                        self._index[rel_path] = table
-                        self.total_symbols += len(table.symbols)
-                    # S4 第 35-36 天：切片 → 向量化 → 写入向量库
-                    self._index_file_to_vector_store(full_path, rel_path, table)
-                except Exception as e:
-                    logger.warning(f"[IndexService] 索引文件失败 {rel_path}: {e}")
-                finally:
-                    with self._lock:
-                        self.processed += 1
+        # 3-4. 逐文件处理 + 批量提交
+        batch_chunks: List[CodeChunk] = []
+        batch_file_paths: List[str] = []
+        batch_size = _get_batch_size()
 
-            with self._lock:
-                self.status = "done"
-                self.message = f"索引完成，共 {self.total_symbols} 个符号"
+        for rel_path in ordered_files:
+            full_path = os.path.join(workspace_root, rel_path)
+            try:
+                table = parse_file(full_path)
+                table.file_path = rel_path
+                with self._lock:
+                    self._index[rel_path] = table
+                    self.total_symbols += len(table.symbols)
 
-            return {"job_id": self.job_id, "total_files": self.total}
+                # 切片并加入批次缓冲区
+                chunks = chunk_file(full_path, table)
+                batch_chunks.extend(chunks)
+                batch_file_paths.append(rel_path)
+            except Exception as e:
+                logger.warning(f"[IndexService] 索引文件失败 {rel_path}: {e}")
+            finally:
+                with self._lock:
+                    self.processed += 1
+                self._write_progress_to_redis()
 
-        except Exception as e:
-            with self._lock:
-                self.status = "error"
-                self.message = str(e)
-            raise
+            # 每 batch_size 个文件批量提交一次
+            if len(batch_file_paths) >= batch_size:
+                self._flush_batch(batch_chunks, batch_file_paths)
+                batch_chunks = []
+                batch_file_paths = []
 
-    def _index_file_to_vector_store(
-        self, full_path: str, rel_path: str, table: SymbolTable
+        # 处理剩余的批次
+        if batch_chunks:
+            self._flush_batch(batch_chunks, batch_file_paths)
+
+        # 6. 完成
+        with self._lock:
+            self.status = "done"
+            self.message = f"索引完成，共 {self.total_symbols} 个符号"
+        self._write_progress_to_redis()
+        self._write_index_marker(workspace_root)
+        logger.info(f"[IndexService] 索引完成 job_id={self.job_id} symbols={self.total_symbols}")
+
+    @staticmethod
+    def _reorder_priority(
+        files: List[str], priority_files: Optional[List[str]]
+    ) -> List[str]:
+        """
+        将 priority_files 排在列表前面，其余保持原序。
+
+        实现"即用即索引"策略：优先索引用户当前打开的文件，
+        其余文件后台静默处理。
+        """
+        if not priority_files:
+            return files
+        files_set = set(files)
+        # 去重且保持顺序：先按 priority_files 的顺序，再按 files 的顺序
+        seen = set()
+        result: List[str] = []
+        # 1. 按 priority_files 指定的顺序优先排列
+        for f in priority_files:
+            if f in files_set and f not in seen:
+                result.append(f)
+                seen.add(f)
+        # 2. 剩余文件按原始顺序追加
+        for f in files:
+            if f not in seen:
+                result.append(f)
+                seen.add(f)
+        return result
+
+    def _flush_batch(
+        self, chunks: List[CodeChunk], file_paths: List[str]
     ) -> None:
         """
-        对单个文件执行：切片 → 向量化 → 删旧向量 → 插新向量。
+        批量提交：向量化 → 删除旧向量 → 批量写入。
 
-        任何环节失败仅记录日志，不中断整体索引流程（保证索引不中断，S4 风险应对）。
+        任何环节失败仅记录日志，不中断整体索引流程
+        （保证索引不中断，S4 风险应对）。
         """
+        if not chunks:
+            return
+
         try:
-            chunks = chunk_file(full_path, table)
-            if not chunks:
-                return
             embed_client = get_embedding_client()
             embed_client.embed_chunks(chunks)
             store = get_vector_store()
-            # 先删旧向量（该文件可能此前已索引过），再写入新向量
-            store.delete_by_file(rel_path)
+            # 先批量删除旧向量（这些文件此前可能已索引过）
+            for fp in file_paths:
+                try:
+                    store.delete_by_file(fp)
+                except Exception as e:
+                    logger.warning(f"[IndexService] 删除旧向量失败 {fp}: {e}")
+            # 批量写入新向量
             store.insert_chunks(chunks)
+            logger.debug(
+                f"[IndexService] 批次提交完成: {len(file_paths)} 个文件, "
+                f"{len(chunks)} 个 Chunk"
+            )
         except Exception as e:
-            logger.warning(f"[IndexService] 文件向量化入库失败 {rel_path}: {e}")
+            logger.warning(f"[IndexService] 批次向量化入库失败: {e}", exc_info=True)
 
-    def update_file(self, workspace_root: str, file_path: str, action: str) -> dict:
+    def _write_progress_to_redis(self) -> None:
+        """
+        将当前索引进度写入 Redis。
+
+        Redis 不可用时静默降级（不影响索引），插件轮询 GET /status
+        时会回退到内存状态。
+        """
+        job_id = self.job_id
+        if not job_id:
+            return
+        status = self.get_status()
+        try:
+            from app.services.redis_client import get_redis_sync
+            r = get_redis_sync()
+            if r is not None:
+                r.setex(
+                    f"{_get_redis_key_prefix()}:{job_id}",
+                    _get_redis_ttl(),
+                    json.dumps(status, ensure_ascii=False),
+                )
+        except Exception as e:
+            logger.debug(f"[IndexService] Redis 进度写入失败（不影响索引）: {e}")
+
+    def _write_index_marker(self, workspace_root: str) -> None:
+        """写入索引完成标记文件，供插件检测当前仓库是否已索引。"""
+        try:
+            marker_path = os.path.join(workspace_root, _get_marker_file())
+            os.makedirs(os.path.dirname(marker_path), exist_ok=True)
+            with open(marker_path, "w", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "job_id": self.job_id,
+                    "completed_at": time.time(),
+                    "total_symbols": self.total_symbols,
+                    "workspace_root": workspace_root,
+                }, ensure_ascii=False, indent=2))
+            logger.debug(f"[IndexService] 索引标记文件已写入: {marker_path}")
+        except Exception as e:
+            logger.warning(f"[IndexService] 写入索引标记文件失败: {e}")
+
+    def wait_for_done(self, timeout: float = 60.0) -> bool:
+        """
+        等待后台索引线程完成（测试用）。
+
+        Args:
+            timeout: 超时秒数
+
+        Returns:
+            True 表示索引完成（done 或 error），False 表示超时
+        """
+        if self._index_thread is None:
+            return True
+        self._index_thread.join(timeout=timeout)
+        return not self._index_thread.is_alive()
+
+    # ============================================================
+    # 增量更新
+    # ============================================================
+
+    def update_file(self, file_path: str, action: str, workspace_root: Optional[str] = None) -> dict:
         """
         增量更新：处理单个文件的变更。
 
         action: modified / deleted / renamed
+
+        第 37-38 天改进：
+        - 使用缓存的 workspace_root（首次索引时传入），无需每次由插件传入
+        - 支持外部传入 workspace_root 覆盖（如插件切换项目时）
         """
+        root = workspace_root or self.workspace_root or os.getcwd()
+
         if action == "deleted":
             with self._lock:
                 removed = self._index.pop(file_path, None)
                 count = len(removed.symbols) if removed else 0
                 self.total_symbols = max(0, self.total_symbols - count)
-            # S4 第 35-36 天：同步删除向量库中的旧向量
+            # 同步删除向量库中的旧向量
             try:
                 get_vector_store().delete_by_file(file_path)
             except Exception as e:
                 logger.warning(f"[IndexService] 删除向量库记录失败 {file_path}: {e}")
-            return {"success": True, "message": f"已删除 {file_path} 的索引", "symbols_count": 0}
+            return {
+                "success": True,
+                "message": f"已删除 {file_path} 的索引",
+                "symbols_count": 0,
+            }
 
         # modified / renamed: 重新解析
-        full_path = os.path.join(workspace_root, file_path)
+        full_path = os.path.join(root, file_path)
         if not os.path.exists(full_path):
             return {"success": False, "message": f"文件不存在: {file_path}", "symbols_count": 0}
 
@@ -206,14 +473,39 @@ class IndexService:
             self._index[file_path] = table
             self.total_symbols = self.total_symbols - old_count + len(table.symbols)
 
-        # S4 第 35-36 天：重新切片向量化并写入向量库
-        self._index_file_to_vector_store(full_path, file_path, table)
+        # 重新切片向量化并写入向量库（单文件无需批量，直接处理）
+        self._index_single_file_to_store(full_path, file_path, table)
 
         return {
             "success": True,
             "message": f"已更新 {file_path} 的索引",
             "symbols_count": len(table.symbols),
         }
+
+    def _index_single_file_to_store(
+        self, full_path: str, rel_path: str, table: SymbolTable
+    ) -> None:
+        """
+        对单个文件执行：切片 → 向量化 → 删旧向量 → 插新向量。
+
+        用于增量更新（单文件，无需批量）。
+        任何环节失败仅记录日志，不中断流程。
+        """
+        try:
+            chunks = chunk_file(full_path, table)
+            if not chunks:
+                return
+            embed_client = get_embedding_client()
+            embed_client.embed_chunks(chunks)
+            store = get_vector_store()
+            store.delete_by_file(rel_path)
+            store.insert_chunks(chunks)
+        except Exception as e:
+            logger.warning(f"[IndexService] 文件向量化入库失败 {rel_path}: {e}")
+
+    # ============================================================
+    # 符号查询
+    # ============================================================
 
     def get_symbols(self, file_path: Optional[str] = None) -> List[dict]:
         """获取已索引的符号（调试/搜索用）"""

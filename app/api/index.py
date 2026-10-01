@@ -1,8 +1,8 @@
 # app/api/index.py
-# S4 第 31-32 天：代码索引控制接口
-# - POST /v1/index/start   触发全量索引
-# - GET  /v1/index/status  查询索引进度
-# - POST /v1/index/update  增量更新通知
+# S4 第 31-38 天：代码索引控制接口
+# - POST /v1/index/start   触发全量索引（后台线程异步执行，立即返回 job_id）
+# - GET  /v1/index/status  查询索引进度（优先 Redis，降级内存）
+# - POST /v1/index/update  增量更新通知（复用首次索引的 workspace_root）
 
 import logging
 
@@ -27,12 +27,18 @@ async def start_index(request: IndexStartRequest):
     触发全量索引
 
     输入工作区根路径，后端扫描并解析所有支持的源文件，建立符号表索引。
+    第 37-38 天改造：后台线程异步执行，立即返回 job_id，不阻塞请求。
+
+    - workspace_root: 工作区根路径
+    - force_rebuild: 是否强制重建索引
+    - priority_files: 优先索引的文件列表（相对路径），实现"即用即索引"
     """
     service = get_index_service()
     try:
         result = service.start_index(
             workspace_root=request.workspace_root,
             force_rebuild=request.force_rebuild,
+            priority_files=request.priority_files,
         )
         return IndexStartResponse(
             job_id=result["job_id"],
@@ -51,10 +57,21 @@ async def get_index_status():
     查询索引进度
 
     返回当前索引状态、已处理文件数、进度百分比、符号总数等。
+    第 37-38 天：优先从 Redis 读取（多实例场景下更准确），
+    Redis 不可用时降级到内存状态。
     """
     service = get_index_service()
-    status = service.get_status()
-    return IndexStatusResponse(**status)
+    # 优先 Redis，降级内存
+    status = service.get_status_from_redis() or service.get_status()
+    # IndexStatusResponse 不含 workspace_root，过滤掉
+    return IndexStatusResponse(
+        status=status["status"],
+        total=status["total"],
+        processed=status["processed"],
+        percentage=status["percentage"],
+        total_symbols=status["total_symbols"],
+        message=status["message"],
+    )
 
 
 @router.post("/update", response_model=IndexUpdateResponse)
@@ -63,14 +80,10 @@ async def update_index(request: IndexUpdateRequest):
     增量更新通知
 
     由插件在文件保存/删除/重命名时调用，后端仅重新处理该文件。
+    第 37-38 天：复用首次索引时缓存的 workspace_root，无需插件每次传入。
     """
-    # 注意：workspace_root 应由插件在首次索引时传入并缓存，
-    # 第 31-32 天暂用当前工作目录，第 37-38 天完善工作区管理。
-    import os
-    workspace_root = os.getcwd()
     service = get_index_service()
     result = service.update_file(
-        workspace_root=workspace_root,
         file_path=request.file_path,
         action=request.action,
     )
