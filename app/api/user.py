@@ -28,7 +28,7 @@ class UsageResponse(BaseModel):
     reset_at: str
 
 
-@router.get("/user/usage", response_model=UsageResponse, response_model_by_alias=False)
+@router.get("/usage", response_model=UsageResponse, response_model_by_alias=False)
 async def get_usage(current_user: dict = Depends(get_current_user)):
     """
     查询当前用户今日 Token 用量（S3 第 21-22 天）。

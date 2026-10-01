@@ -48,7 +48,7 @@ def _extract_system_content(messages: List[dict]) -> tuple:
     return system_content, non_system
 
 
-@router.post("/chat/completions")
+@router.post("/completions")
 async def chat_completions(
         request: ChatRequest,
         current_user: dict = Depends(get_current_user)

@@ -24,7 +24,7 @@ class ModelItem(BaseModel):
     context_window: int
 
 
-@router.get("/models", response_model=list[ModelItem])
+@router.get("", response_model=list[ModelItem])
 async def list_models(current_user: dict = Depends(get_current_user)):
     """
     获取可用模型列表（S3 第 23-24 天）。

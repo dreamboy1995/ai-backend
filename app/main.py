@@ -78,14 +78,14 @@ def create_app() -> FastAPI:
 
     # 注册路由
     app.include_router(auth_router, tags=["认证"])
-    app.include_router(chat_router, prefix="/v1", tags=["聊天"])
+    app.include_router(chat_router, prefix="/v1/chat", tags=["聊天"])
     app.include_router(files_router, prefix="/v1/files", tags=["文件操作"])
     app.include_router(search_router, prefix="/v1/search", tags=["代码搜索"])
     app.include_router(terminal_router, prefix="/v1/terminal", tags=["终端"])
     # S3 第 21-22 天：用户用量查询接口
-    app.include_router(user_router, prefix="/v1", tags=["用户"])
+    app.include_router(user_router, prefix="/v1/user", tags=["用户"])
     # S3 第 23-24 天：模型列表接口
-    app.include_router(models_router, prefix="/v1", tags=["模型"])
+    app.include_router(models_router, prefix="/v1/models", tags=["模型"])
     # S4 第 31-32 天：代码索引控制接口
     app.include_router(index_router, prefix="/v1/index", tags=["代码索引"])
 
