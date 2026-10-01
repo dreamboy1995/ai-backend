@@ -8,3 +8,5 @@ __pycache__/
 .env
 # S4 代码索引：本地向量库、Embedding 缓存、索引标记文件
 .ai_index/
+# S5 BM25 索引缓存（pickle 序列化文件）
+.ai_cache/

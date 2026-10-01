@@ -286,6 +286,12 @@ class IndexService:
             vector_store.create_table(vector_dim=embed_client.dimension)
             if force_rebuild:
                 vector_store.clear_table()
+                # S5 第 41-42 天：强制重建时同时清空 BM25 索引
+                try:
+                    from .bm25_index import get_bm25_index
+                    get_bm25_index().clear()
+                except Exception as e:
+                    logger.warning(f"[IndexService] 清空 BM25 索引失败: {e}")
         except Exception as e:
             logger.warning(f"[IndexService] 向量库初始化失败，索引将跳过向量化: {e}")
 
@@ -361,6 +367,14 @@ class IndexService:
             )
         except Exception as e:
             logger.warning(f"[IndexService] 依赖图持久化失败: {e}")
+
+        # S5 第 41-42 天：全量索引完成后构建 BM25 关键词索引
+        try:
+            from .bm25_index import get_bm25_index
+            bm25_count = get_bm25_index().build()
+            logger.info(f"[IndexService] BM25 索引构建完成：{bm25_count} 个 Chunk")
+        except Exception as e:
+            logger.warning(f"[IndexService] BM25 索引构建失败（不影响索引流程）: {e}")
 
         with self._lock:
             self.status = "done"
@@ -517,6 +531,12 @@ class IndexService:
                 dep_graph.save(_get_graph_persist_path(root))
             except Exception as e:
                 logger.warning(f"[IndexService] 删除依赖图记录失败 {file_path}: {e}")
+            # S5 第 41-42 天：标记 BM25 索引为脏数据（下次检索时重建）
+            try:
+                from .bm25_index import get_bm25_index
+                get_bm25_index().mark_dirty()
+            except Exception as e:
+                logger.warning(f"[IndexService] 标记 BM25 索引失败: {e}")
             return {
                 "success": True,
                 "message": f"已删除 {file_path} 的索引",
@@ -545,6 +565,13 @@ class IndexService:
             dep_graph.save(_get_graph_persist_path(root))
         except Exception as e:
             logger.warning(f"[IndexService] 依赖图增量更新失败 {file_path}: {e}")
+
+        # S5 第 41-42 天：标记 BM25 索引为脏数据（下次检索时重建）
+        try:
+            from .bm25_index import get_bm25_index
+            get_bm25_index().mark_dirty()
+        except Exception as e:
+            logger.warning(f"[IndexService] 标记 BM25 索引失败: {e}")
 
         return {
             "success": True,

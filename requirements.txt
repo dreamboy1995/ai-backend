@@ -30,3 +30,9 @@ numpy
 # 向量维度由 embedding_version 字段标识，切换模型时重建表即可（LanceDB 不支持维度自动迁移）。
 lancedb>=0.10.0
 pyarrow>=16.0.0
+
+# S5 第 41-42 天：BM25 关键词检索
+# rank-bm25 提供 BM25Okapi 等经典 BM25 变体，纯 Python 实现、无外部依赖。
+# jieba 用于中文分词（rank-bm25 默认按空格分词，对中文无效，必须预处理）。
+rank-bm25>=0.2.2
+jieba>=0.42.1

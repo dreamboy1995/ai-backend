@@ -98,6 +98,23 @@ class Settings(BaseSettings):
     # 依赖图 BFS 查询最大深度（防止全图遍历）
     GRAPH_MAX_DEPTH: int = 5
 
+    # S5 第 41-42 天：BM25 关键词检索配置
+    # BM25 索引序列化文件路径（pickle），避免每次启动都重建
+    BM25_INDEX_PATH: str = ".ai_cache/bm25_index.pkl"
+    # BM25 检索默认返回 top_k
+    BM25_DEFAULT_TOP_K: int = 20
+    # 是否跳过测试文件（路径含 test/ 或文件名以 test_ 开头），
+    # 降低大仓库 BM25 词袋矩阵的磁盘占用（S5 风险预警）
+    BM25_SKIP_TEST_FILES: bool = True
+    # 仅索引最近 N 个月修改过的文件（0 表示不限制）。
+    # 大型仓库（10万+文件）的 BM25 词袋矩阵可能膨胀到数 GB，
+    # 通过限制时间窗口控制索引规模（S5 风险预警）。
+    BM25_RECENT_MONTHS: int = 0
+    # BM25Okapi 的 k1 参数（词频饱和度，经典值 1.5）
+    BM25_K1: float = 1.5
+    # BM25Okapi 的 b 参数（文档长度归一化，经典值 0.75）
+    BM25_B: float = 0.75
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
