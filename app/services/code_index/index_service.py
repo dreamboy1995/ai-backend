@@ -1,5 +1,5 @@
 """
-索引服务（S4 第 31-38 天）
+索引服务（S4 第 31-40 天）
 
 管理代码库索引的状态与流程。
 
@@ -13,6 +13,11 @@
             - 索引进度写入 Redis（供插件轮询展示），Redis 不可用时降级为内存
             - "即用即索引"策略：priority_files 优先处理，后台静默索引剩余文件
             - 索引完成后写入 .ai_index 标记文件，供插件检测仓库是否已索引
+第 39-40 天：依赖关系图构建
+            - 在 AST 解析后，额外提取 import / call 引用关系，构建 Call Graph
+            - 图存储为 JSON 文件 + 内存缓存（MVP 阶段不引入 Neo4j）
+            - 全量索引结束后整体持久化；增量更新时局部修改后重新持久化
+            - 提供 GET /v1/graph/related?file=xxx&depth=2 接口供下游检索使用
 """
 
 import json
@@ -26,6 +31,7 @@ from typing import Dict, List, Optional
 
 from .ast_parser import parse_file
 from .code_chunker import chunk_file
+from .dependency_graph import get_dependency_graph
 from .embedding_client import get_embedding_client
 from .models import CodeChunk, SymbolTable
 from .parser_factory import is_supported
@@ -70,6 +76,21 @@ def _get_marker_file() -> str:
         return settings.INDEX_MARKER_FILE
     except Exception:
         return ".ai_index/index_done"
+
+
+def _get_graph_file() -> Optional[str]:
+    """依赖图 JSON 持久化文件路径（相对工作区根目录）"""
+    try:
+        from app.config import settings
+        return settings.DEPENDENCY_GRAPH_FILE
+    except Exception:
+        return ".ai_index/dependency_graph.json"
+
+
+def _get_graph_persist_path(workspace_root: str) -> str:
+    """依赖图持久化文件的绝对路径"""
+    rel = _get_graph_file() or ".ai_index/dependency_graph.json"
+    return os.path.join(workspace_root, rel)
 
 
 class IndexService:
@@ -258,7 +279,7 @@ class IndexService:
         5. 更新进度到 Redis
         6. 完成后写入标记文件
         """
-        # 1. 初始化向量库
+        # 1. 初始化向量库与依赖图
         vector_store = get_vector_store()
         try:
             embed_client = get_embedding_client()
@@ -268,9 +289,24 @@ class IndexService:
         except Exception as e:
             logger.warning(f"[IndexService] 向量库初始化失败，索引将跳过向量化: {e}")
 
+        # 依赖图初始化：force_rebuild 时清空；否则尝试从 JSON 恢复
+        dep_graph = get_dependency_graph()
+        if force_rebuild:
+            dep_graph.clear()
+        else:
+            graph_file = _get_graph_persist_path(workspace_root)
+            if not dep_graph.load(graph_file):
+                dep_graph.clear()
+
         # 2. 重排文件：priority_files 优先
         ordered_files = self._reorder_priority(files, priority_files)
         logger.info(f"[IndexService] 开始索引 {len(ordered_files)} 个文件")
+
+        # 预注册所有文件到依赖图（确保 import 解析能匹配到本地文件，
+        # 即使被 import 的文件在遍历顺序中靠后）
+        from .parser_factory import detect_language
+        for rel_path in ordered_files:
+            dep_graph.register_file(rel_path, detect_language(rel_path))
 
         # 3-4. 逐文件处理 + 批量提交
         batch_chunks: List[CodeChunk] = []
@@ -290,6 +326,12 @@ class IndexService:
                 chunks = chunk_file(full_path, table)
                 batch_chunks.extend(chunks)
                 batch_file_paths.append(rel_path)
+
+                # 第 39-40 天：构建依赖图（提取 import / call 边）
+                try:
+                    dep_graph.build_from_file(rel_path, table, full_path=full_path)
+                except Exception as e:
+                    logger.debug(f"[IndexService] 依赖图构建失败 {rel_path}: {e}")
             except Exception as e:
                 logger.warning(f"[IndexService] 索引文件失败 {rel_path}: {e}")
             finally:
@@ -307,7 +349,19 @@ class IndexService:
         if batch_chunks:
             self._flush_batch(batch_chunks, batch_file_paths)
 
-        # 6. 完成
+        # 6. 完成：持久化依赖图并写标记
+        try:
+            dep_graph.save(_get_graph_persist_path(workspace_root))
+            graph_stats = dep_graph.stats()
+            logger.info(
+                f"[IndexService] 依赖图已持久化: "
+                f"{graph_stats['local_files']} 文件, "
+                f"{graph_stats['file_edges']} 文件边, "
+                f"{graph_stats['call_edges']} 调用边"
+            )
+        except Exception as e:
+            logger.warning(f"[IndexService] 依赖图持久化失败: {e}")
+
         with self._lock:
             self.status = "done"
             self.message = f"索引完成，共 {self.total_symbols} 个符号"
@@ -441,19 +495,28 @@ class IndexService:
         第 37-38 天改进：
         - 使用缓存的 workspace_root（首次索引时传入），无需每次由插件传入
         - 支持外部传入 workspace_root 覆盖（如插件切换项目时）
+
+        第 39-40 天改进：
+        - 同步更新依赖图：删除旧边、提取新引用关系、重新持久化
         """
         root = workspace_root or self.workspace_root or os.getcwd()
+        dep_graph = get_dependency_graph()
 
         if action == "deleted":
             with self._lock:
                 removed = self._index.pop(file_path, None)
                 count = len(removed.symbols) if removed else 0
                 self.total_symbols = max(0, self.total_symbols - count)
-            # 同步删除向量库中的旧向量
+            # 同步删除向量库与依赖图中的旧记录
             try:
                 get_vector_store().delete_by_file(file_path)
             except Exception as e:
                 logger.warning(f"[IndexService] 删除向量库记录失败 {file_path}: {e}")
+            try:
+                dep_graph.remove_file(file_path)
+                dep_graph.save(_get_graph_persist_path(root))
+            except Exception as e:
+                logger.warning(f"[IndexService] 删除依赖图记录失败 {file_path}: {e}")
             return {
                 "success": True,
                 "message": f"已删除 {file_path} 的索引",
@@ -475,6 +538,13 @@ class IndexService:
 
         # 重新切片向量化并写入向量库（单文件无需批量，直接处理）
         self._index_single_file_to_store(full_path, file_path, table)
+
+        # 同步更新依赖图：重新提取引用关系并持久化
+        try:
+            dep_graph.build_from_file(file_path, table, full_path=full_path)
+            dep_graph.save(_get_graph_persist_path(root))
+        except Exception as e:
+            logger.warning(f"[IndexService] 依赖图增量更新失败 {file_path}: {e}")
 
         return {
             "success": True,

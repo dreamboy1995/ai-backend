@@ -10,6 +10,9 @@
   - search(query_vector, top_k) : 向量相似度检索，返回相似 Chunk 列表（含距离分数）
   - delete_by_file(file_path): 删除指定文件的所有 Chunk（文件删除/重命名时清理旧向量）
 
+维护：
+  - compact(older_than, delete_unverified): 合并分片并清理旧版本快照，回收磁盘空间
+
 风险应对（S4 关键技术预研）：
   - 向量维度不兼容：LanceDB 不支持维度自动迁移。
     切换 Embedding 模型时，create_table 会检测维度变化，drop 旧表后重建，
@@ -18,6 +21,7 @@
 
 import logging
 import os
+from datetime import timedelta
 from typing import Any, Dict, List, Optional
 
 import lancedb
@@ -316,6 +320,82 @@ class VectorStore:
     def _escape(value: str) -> str:
         """转义 SQL filter 字符串中的单引号"""
         return value.replace("'", "''")
+
+    # ============================================================
+    # 维护：合并分片 + 清理旧版本
+    # ============================================================
+
+    def compact(
+        self,
+        older_than: timedelta = timedelta(seconds=0),
+        delete_unverified: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        压缩表并清理旧版本快照，回收磁盘空间。
+
+        LanceDB 每次写入都会生成一份 manifest + txn，长期累积会显著占用磁盘
+        且降低查询性能。本方法对表执行：
+          - 合并 data/ 下小分片为紧凑分片（compaction）
+          - 清理 older_than 之前的旧版本 manifest
+          - 清理未验证的事务文件（可选）
+
+        注意：清理后无法再回滚到旧版本（time travel 失效）。生产/线上若需
+        保留时间旅行能力，请传 older_than=timedelta(days=7) 之类保留窗口。
+
+        Args:
+            older_than:        保留该时长内的版本；早于该时长的版本被清理。
+                               默认 timedelta(seconds=0) 表示仅保留当前最新版本。
+            delete_unverified: 是否清理未验证的事务文件，默认 True。
+
+        Returns:
+            报告 dict，含清理前后 {manifests, txns, data_files, size_bytes}。
+        """
+        table = self._get_table()
+        before = self._stats()
+        try:
+            table.optimize(
+                cleanup_older_than=older_than,
+                delete_unverified=delete_unverified,
+            )
+        except Exception as e:
+            logger.error(f"[VectorStore] compact 失败: {e}", exc_info=True)
+            raise
+        after = self._stats()
+        logger.info(
+            f"[VectorStore] compact 完成："
+            f"manifests {before['manifests']} -> {after['manifests']}，"
+            f"data_files {before['data_files']} -> {after['data_files']}，"
+            f"size {before['size_bytes']}B -> {after['size_bytes']}B"
+        )
+        return {"before": before, "after": after}
+
+    def _stats(self) -> Dict[str, Any]:
+        """统计当前表目录下的 manifest/txn/data 文件数与总占用大小（字节）"""
+        base = os.path.join(self.db_path, f"{self.table_name}.lance")
+        manifests = txns = data_files = 0
+        size_bytes = 0
+        if os.path.isdir(base):
+            for root, _, files in os.walk(base):
+                for f in files:
+                    try:
+                        size_bytes += os.path.getsize(os.path.join(root, f))
+                    except OSError:
+                        pass
+            vdir = os.path.join(base, "_versions")
+            if os.path.isdir(vdir):
+                manifests = len([f for f in os.listdir(vdir) if f.endswith(".manifest")])
+            tdir = os.path.join(base, "_transactions")
+            if os.path.isdir(tdir):
+                txns = len([f for f in os.listdir(tdir) if f.endswith(".txn")])
+            ddir = os.path.join(base, "data")
+            if os.path.isdir(ddir):
+                data_files = len(os.listdir(ddir))
+        return {
+            "manifests": manifests,
+            "txns": txns,
+            "data_files": data_files,
+            "size_bytes": size_bytes,
+        }
 
     # ============================================================
     # 辅助

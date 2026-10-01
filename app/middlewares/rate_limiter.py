@@ -40,7 +40,9 @@ RATE_LIMIT_LIMIT_HEADER = "X-RateLimit-Limit"
 RATE_LIMITED_PREFIX = "/v1/"
 
 # 不限频的路径（状态查询等轻量接口，不应消耗用户的请求配额）
-RATE_LIMIT_EXEMPT_PATHS = {"/v1/user/usage"}
+# - /v1/user/usage: 用户配额查询
+# - /v1/index/status: 索引进度查询（前端索引过程中会高频轮询）
+RATE_LIMIT_EXEMPT_PATHS = {"/v1/user/usage", "/v1/index/status"}
 
 # 窗口定义：(窗口秒数, 最大请求数, 配置项)
 _WINDOW_MINUTE = 60       # 每分钟窗口

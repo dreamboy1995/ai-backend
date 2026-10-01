@@ -75,6 +75,42 @@ class SearchResponse(BaseModel):
     results: List[SearchResultItem]
 
 
+# ============================================================
+# S4 第 39-40 天：依赖关系图接口数据结构
+# ============================================================
+
+class GraphEdgeInfo(BaseModel):
+    """图边信息"""
+    source: str
+    target: str
+    edge_type: str          # "import" | "call"
+    line: int = 0
+    raw: str = ""           # 原始引用文本
+
+
+class GraphRelatedItem(BaseModel):
+    """关联文件项"""
+    file_path: str
+    direction: str          # "upstream" | "downstream"
+    depth: int
+    edge: Optional[GraphEdgeInfo] = None
+
+
+class GraphRelatedResponse(BaseModel):
+    """关联文件查询响应"""
+    file_path: str
+    depth: int
+    upstream: List[GraphRelatedItem] = []      # 被查询文件依赖的文件（import 的目标）
+    downstream: List[GraphRelatedItem] = []    # 依赖被查询文件的文件（import 的来源）
+    total: int = 0
+
+
+class GraphImportsResponse(BaseModel):
+    """文件 import 关系响应（用于验收：返回该文件 import 的所有本地模块名）"""
+    file_path: str
+    imports: List[dict] = []
+
+
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant"]
     content: str

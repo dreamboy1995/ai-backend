@@ -89,6 +89,15 @@ class Settings(BaseSettings):
     # 索引完成标记文件路径（相对工作区根目录），供插件检测当前仓库是否已索引
     INDEX_MARKER_FILE: str = ".ai_index/index_done"
 
+    # S4 第 39-40 天：依赖关系图（Call Graph）配置
+    # MVP 阶段采用 JSON 文件 + 内存缓存，避免引入 Neo4j 中间件
+    # 全量索引结束后整体持久化；增量更新时局部修改后重新持久化
+    DEPENDENCY_GRAPH_FILE: str = ".ai_index/dependency_graph.json"
+    # 依赖图 BFS 查询默认深度（GET /v1/graph/related?depth=...）
+    GRAPH_DEFAULT_DEPTH: int = 2
+    # 依赖图 BFS 查询最大深度（防止全图遍历）
+    GRAPH_MAX_DEPTH: int = 5
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
