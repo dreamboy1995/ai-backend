@@ -42,6 +42,32 @@ class IndexUpdateResponse(BaseModel):
     symbols_count: int = 0
 
 
+# ============================================================
+# S4 第 35-36 天：代码语义搜索接口数据结构
+# ============================================================
+
+class SearchResultItem(BaseModel):
+    """单条语义搜索结果"""
+    id: str
+    file_path: str
+    symbol_name: str
+    chunk_type: str
+    content: str
+    start_line: int
+    end_line: int
+    embedding_version: str = ""
+    distance: float = 0.0          # LanceDB L2 距离（越小越相似）
+    score: float = 0.0             # 归一化相似度（0~1，越大越相似）
+
+
+class SearchResponse(BaseModel):
+    """语义搜索响应"""
+    query: str
+    top_k: int
+    total: int                     # 实际返回的结果数
+    results: List[SearchResultItem]
+
+
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant"]
     content: str

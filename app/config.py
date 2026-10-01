@@ -54,6 +54,31 @@ class Settings(BaseSettings):
     CHAT_MAX_TOKENS: int = 4096              # 普通对话默认 max_tokens
     NEW_FILE_MAX_TOKENS: int = 8192          # /new 单文件生成默认 max_tokens
 
+    # S4 第 33-34 天：代码向量化配置
+    # embedding_mode:
+    #   - "local"  : 使用本地 sentence-transformers 模型（all-MiniLM-L6-v2，384 维）
+    #   - "remote" : 调用远程 Embedding API（OpenAI text-embedding-3-small，1536 维）
+    #   - "auto"   : 优先本地，加载失败或过慢时自动降级到远程
+    EMBEDDING_MODE: str = "auto"
+    EMBEDDING_LOCAL_MODEL: str = "all-MiniLM-L6-v2"   # 本地模型名（~80MB，CPU 可跑）
+    # 本地模型加载超时（秒）。首次运行需从 HuggingFace 下载模型（~80MB），
+    # 故默认设为 120s；模型缓存后加载通常 < 3s。
+    EMBEDDING_LOCAL_LOAD_TIMEOUT: float = 120.0
+    EMBEDDING_API_KEY: str = ""
+    EMBEDDING_REMOTE_MODEL: str = "text-embedding-3-small"
+    EMBEDDING_REMOTE_API_BASE: str = "https://api.openai.com/v1"
+    EMBEDDING_REMOTE_BATCH_SIZE: int = 64
+    EMBEDDING_CACHE_DB: str = ".ai_index/embeddings_cache.sqlite"  # 远程向量缓存库
+    # 向量模型版本由后端自动检测（如 all-MiniLM-L6-v2-384 / text-embedding-3-small-1536），
+    # 写入每个 Chunk 的 embedding_version 字段，用于维度迁移（S4 风险预警）。
+
+    # S4 第 35-36 天：向量数据库（LanceDB）配置
+    # LanceDB 为纯文件嵌入式存储，db_path 为目录路径；无需外部服务。
+    VECTOR_STORE_DB_PATH: str = ".ai_index/lancedb"
+    VECTOR_STORE_TABLE_NAME: str = "code_chunks"
+    # 向量搜索默认返回 top_k
+    VECTOR_SEARCH_TOP_K: int = 10
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

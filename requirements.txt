@@ -17,3 +17,16 @@ tree-sitter-javascript
 tree-sitter-typescript
 tree-sitter-java
 tree-sitter-go
+
+# S4 第 33-34 天：代码向量化
+# sentence-transformers 提供 all-MiniLM-L6-v2 等轻量本地 Embedding 模型（384 维，~80MB）。
+# 若本地模型加载失败或过慢，会自动降级到远程 OpenAI text-embedding-3-small API
+# （结果缓存到本地 SQLite，避免重复计算）。
+sentence-transformers>=2.2.0
+numpy
+
+# S4 第 35-36 天：向量数据库
+# LanceDB 基于 Lance 列式存储，纯文件、免安装、无外部依赖，满足 P2 "嵌入式" 要求。
+# 向量维度由 embedding_version 字段标识，切换模型时重建表即可（LanceDB 不支持维度自动迁移）。
+lancedb>=0.10.0
+pyarrow>=16.0.0
