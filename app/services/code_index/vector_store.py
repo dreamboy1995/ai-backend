@@ -284,6 +284,78 @@ class VectorStore:
         return output
 
     # ============================================================
+    # 按 ID 批量查询（供 S5 RRF 融合后补全候选 chunk 元信息）
+    # ============================================================
+
+    def fetch_chunks_by_ids(self, chunk_ids: List[str]) -> List[Dict[str, Any]]:
+        """
+        按 chunk_id 列表批量查询 chunk 元信息（非向量检索）。
+
+        S5 第 43-44 天：RRF 融合后的候选 chunk_id 来自向量/BM25/符号三路，
+        但只有向量路径带完整元信息（content/file_path/行号）。
+        本方法用 chunk_id 反查 LanceDB，统一补全元信息，供 Cross-Encoder 重排序
+        计算 (query, chunk) 相关性。
+
+        实现策略：
+          - 优先用 LanceDB 的 SQL filter（id IN (...)），单次查询
+          - 若 filter 查询失败（版本/语法差异），降级为全表扫描 + Python 过滤
+
+        Args:
+            chunk_ids: chunk id 列表（去重，最多 100 个，避免 SQL 过长）
+
+        Returns:
+            结果列表，每项含 id/file_path/symbol_name/chunk_type/content/
+            start_line/end_line/embedding_version（不含 embedding 向量，节省内存）
+        """
+        if not chunk_ids:
+            return []
+
+        # 去重并限制长度，避免 SQL IN 列表过长
+        unique_ids = list(dict.fromkeys(chunk_ids))[:100]
+        table = self._get_table()
+
+        # 尝试 1：LanceDB filter 查询（首选，效率高）
+        try:
+            ids_str = ",".join(f"'{self._escape(i)}'" for i in unique_ids)
+            arrow_table = table.search().where(f"id IN ({ids_str})").limit(len(unique_ids)).to_list()
+            # LanceDB 的 search().where() 在某些版本仍要求 vector，回退到 to_arrow(filter=)
+            results = arrow_table
+        except Exception as e:
+            logger.debug(f"[VectorStore] filter 查询失败，降级全表扫描: {e}")
+            # 尝试 2：to_arrow + filter（ LanceDB 0.10+ 支持）
+            try:
+                ids_str = ",".join(f"'{self._escape(i)}'" for i in unique_ids)
+                arrow_table = table.to_arrow(filter=f"id IN ({ids_str})")
+                results = arrow_table.to_pylist()
+            except Exception:
+                # 尝试 3：全表扫描 + Python 过滤（兜底，最慢但最兼容）
+                try:
+                    all_rows = table.to_arrow().select(
+                        ["id", "file_path", "symbol_name", "chunk_type",
+                         "content", "start_line", "end_line", "embedding_version"]
+                    ).to_pylist()
+                    id_set = set(unique_ids)
+                    results = [r for r in all_rows if r.get("id") in id_set]
+                except Exception as e2:
+                    logger.error(f"[VectorStore] fetch_chunks_by_ids 全表扫描失败: {e2}")
+                    return []
+
+        # 转换为统一输出格式（去掉向量字段，避免内存浪费）
+        output: List[Dict[str, Any]] = []
+        for row in results:
+            output.append({
+                "id": row.get("id"),
+                "file_path": row.get("file_path"),
+                "symbol_name": row.get("symbol_name"),
+                "chunk_type": row.get("chunk_type"),
+                "content": row.get("content"),
+                "start_line": row.get("start_line"),
+                "end_line": row.get("end_line"),
+                "embedding_version": row.get("embedding_version", ""),
+            })
+        return output
+
+    # ============================================================
     # 删除
     # ============================================================
 

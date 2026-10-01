@@ -111,6 +111,56 @@ class GraphImportsResponse(BaseModel):
     imports: List[dict] = []
 
 
+# ============================================================
+# S5 第 43-44 天：符号搜索接口数据结构（GET /v1/symbols/search）
+# ============================================================
+
+class SymbolItem(BaseModel):
+    """单条符号搜索结果（供 # 符号下拉框实时补全）"""
+    name: str                                # 符号名（如 DataProcessor）
+    type: str                                 # class / function / variable
+    file_path: str                            # 相对路径
+    line: int                                 # 起始行号（1-based）
+
+
+class SymbolSearchResponse(BaseModel):
+    """符号搜索响应"""
+    query: str
+    limit: int
+    total: int
+    symbols: List[SymbolItem] = []
+
+
+# ============================================================
+# S5 第 43-44 天：Chat 接口 retrieval_config & SSE references
+# ============================================================
+
+class RetrievalConfig(BaseModel):
+    """
+    Chat 请求的检索配置（S5 关键接口变更）。
+
+    - auto_context:      是否自动从索引中检索相关代码并注入 Prompt（S5 默认开启）
+    - top_k:             最终注入 Prompt 的片段数（建议 3~5）
+    - include_references: 是否在 SSE 流中返回 references 元数据块
+                         （前端展示"📎 参考了 N 个代码片段"用）
+    """
+    auto_context: bool = True
+    top_k: int = Field(default=5, ge=1, le=20)
+    include_references: bool = True
+
+
+class ReferenceItem(BaseModel):
+    """
+    SSE 流 references 元数据块中的单条引用（S5 关键接口变更）。
+
+    前端在 AI 回复上方展示"📎 参考了 N 个代码片段"，点击可跳转到对应文件行号。
+    """
+    file: str           # 相对路径（如 src/main.py）
+    lines: str          # 行号范围字符串（如 "12-45"）
+    score: float = 0.0  # 相关性分数（rerank_score 或 rrf_score，越大越相关）
+    symbol: str = ""    # 命中的符号名（便于前端展示函数/类名）
+
+
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant"]
     content: str
@@ -168,6 +218,11 @@ class ChatRequest(BaseModel):
     # - "new":  单文件生成（/new 指令），使用 120s 超时、默认 max_tokens=8192，
     #           因为完整文件生成比对话需要更多推理时间。
     mode: Literal["chat", "new"] = "chat"
+    # S5 第 43-44 天新增：检索配置。auto_context=true 时，后端用 hybrid_search
+    # （向量 + BM25 + 符号 + RRF + Cross-Encoder 重排序）检索相关代码注入 System Prompt。
+    # include_references=true 时，SSE 流首推 type:meta 的 references 数据块，
+    # 前端在 AI 回复上方展示"📎 参考了 N 个代码片段"。
+    retrieval_config: Optional[RetrievalConfig] = None
 
 
 class Delta(BaseModel):
@@ -202,3 +257,22 @@ class ChatChunk(BaseModel):
     model: str
     choices: List[Choice]
     usage: Optional[Usage] = None
+
+
+class ChatMetaChunk(BaseModel):
+    """
+    SSE 流的元数据块（S5 关键接口变更）。
+
+    在第一个 content chunk 之前推送一条 type:meta 数据，承载 references
+    引用列表，供前端在 AI 回复上方渲染"📎 参考了 N 个代码片段"。
+
+    前端状态机：先收到 type:meta 时存储引用列表，流结束时统一渲染，
+    避免 Webview 未渲染完毕时引用信息丢失（S5 风险预警应对）。
+
+    SSE 推送格式：
+        data: {"type":"meta","references":[
+            {"file":"src/main.py","lines":"12-45","score":0.92,"symbol":"foo"}
+        ]}
+    """
+    type: Literal["meta"] = "meta"
+    references: List[ReferenceItem] = []

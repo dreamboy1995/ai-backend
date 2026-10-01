@@ -36,3 +36,10 @@ pyarrow>=16.0.0
 # jieba 用于中文分词（rank-bm25 默认按空格分词，对中文无效，必须预处理）。
 rank-bm25>=0.2.2
 jieba>=0.42.1
+
+# S5 第 43-44 天：三路检索融合 + Cross-Encoder 重排序
+# torch 是 sentence-transformers Cross-Encoder 的推理后端
+# （cross-encoder/ms-marco-MiniLM-L-6-v2 模型约 90MB，CPU 可跑）。
+# CPU 版 torch 在 Windows/Linux/macOS 均可用，无需 GPU。
+# 若安装失败或模型加载失败，FusionReranker 会自动降级为仅 RRF（不重排序）。
+torch>=2.0.0

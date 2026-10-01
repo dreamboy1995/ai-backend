@@ -115,6 +115,32 @@ class Settings(BaseSettings):
     # BM25Okapi 的 b 参数（文档长度归一化，经典值 0.75）
     BM25_B: float = 0.75
 
+    # S5 第 43-44 天：三路检索融合 + RRF + Cross-Encoder 重排序配置
+    # RRF（倒数排名融合）公式的 k 值：RRF_score(doc) = Σ 1 / (k + rank_i(doc))
+    # k=60 为经典值；k 越大，多路命中加成越明显，k 越小排名靠前加成越强
+    RRF_K: int = 60
+    # RRF 融合后保留的候选数（来自向量/BM25/符号三路融合 Top-N）
+    # S5 任务文档要求 Top-30 候选输入 Cross-Encoder
+    RRF_CANDIDATE_K: int = 30
+    # 符号精确检索返回 Top-K（S5 任务文档：Top-10）
+    SYMBOL_SEARCH_TOP_K: int = 10
+    # 混合检索（hybrid_search）最终返回数（注入 Prompt 的片段数）
+    HYBRID_SEARCH_TOP_K: int = 5
+
+    # Cross-Encoder 重排序模型（约 90MB，CPU 可跑）
+    # cross-encoder/ms-marco-MiniLM-L-6-v2 是 MS-MARCO 排行榜轻量级基线，
+    # 对代码场景虽非最优，但作为 P2 阶段 MVP 足够；后续可换为
+    # cross-encoder/ms-code-mistral-7b-v2 等（需 GPU）
+    RERANK_MODEL: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    # 重排序超时熔断阈值（毫秒）。超过则跳过重排序，直接返回 RRF 结果
+    # S5 任务文档要求 300ms；CPU 上对 30 候选逐对推理可能 1s+，故默认 300ms 触发熔断
+    RERANK_TIMEOUT_MS: int = 300
+    # 重排序候选数上限（性能保护）。S5 风险预警：Top-30 在 CPU 上慢，
+    # 限定到 ≤ 10 个候选重排序，平衡延迟与精度
+    RERANK_MAX_CANDIDATES: int = 10
+    # 是否启用重排序（False 时仅走 RRF，跳过 Cross-Encoder，用于压测/降级）
+    RERANK_ENABLED: bool = True
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

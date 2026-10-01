@@ -25,6 +25,7 @@ from app.api.user import router as user_router
 from app.api.models import router as models_router
 from app.api.index import router as index_router
 from app.api.graph import router as graph_router
+from app.api.symbols import router as symbols_router
 
 # 日志配置必须在所有日志调用之前执行
 setup_logging()
@@ -91,6 +92,8 @@ def create_app() -> FastAPI:
     app.include_router(index_router, prefix="/v1/index", tags=["代码索引"])
     # S4 第 39-40 天：依赖关系图查询接口
     app.include_router(graph_router, prefix="/v1/graph", tags=["依赖图"])
+    # S5 第 43-44 天：符号实时补全接口（# 输入触发）
+    app.include_router(symbols_router, prefix="/v1/symbols", tags=["符号搜索"])
 
     # 基础路由
     @app.get("/", tags=["默认"])
