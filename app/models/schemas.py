@@ -132,6 +132,46 @@ class SymbolSearchResponse(BaseModel):
 
 
 # ============================================================
+# S5 第 45-46 天：符号定义定位 & 反向依赖查询接口数据结构
+# ============================================================
+
+class SymbolDefinitionResponse(BaseModel):
+    """
+    符号定义定位响应（GET /v1/symbols/definition）。
+
+    用于验收："输入 #DataProcessor，后端能直接定位到定义该类的文件路径和行号范围"。
+    """
+    name: str                  # 符号名
+    type: str                  # class / function / variable
+    file_path: str             # 相对路径（POSIX 正斜杠）
+    start_line: int            # 起始行号（1-based）
+    end_line: int              # 结束行号（1-based，闭区间）
+
+
+class SymbolCallerItem(BaseModel):
+    """
+    单条反向依赖调用记录（GET /v1/symbols/callers）。
+
+    表示某个函数/模块在某一行调用了查询的符号。
+    """
+    file_path: str             # 调用所在文件（POSIX 相对路径）
+    caller_symbol: str         # 调用者函数名（模块级调用为空字符串）
+    line: int                  # 调用所在行号（1-based）
+    raw: str = ""              # 原始调用文本（如 "obj.save"）
+
+
+class SymbolCallersResponse(BaseModel):
+    """
+    反向依赖查询响应（GET /v1/symbols/callers）。
+
+    用于验收："输入'谁调用了 save()'，能返回 main.py 第 15 行和 utils.py 第 88 行"。
+    """
+    symbol_name: str           # 查询的符号名
+    total: int                 # 调用记录总数
+    callers: List[SymbolCallerItem] = []
+
+
+# ============================================================
 # S5 第 43-44 天：Chat 接口 retrieval_config & SSE references
 # ============================================================
 

@@ -96,200 +96,59 @@ class Candidate:
 
 
 # ============================================================
-# 轻量级符号精确检索（Day 43-44 内置；Day 45-46 将独立为
-# symbol_exact_matcher.py，本类届时会被替换/委托）
+# 符号精确检索（S5 第 45-46 天：委托给 symbol_exact_matcher.py）
+#
+# 本类保留作为 RRF 三路融合的"符号精确召回"输入源接口，
+# 实际匹配逻辑已迁移到 symbol_exact_matcher.SymbolExactMatcher。
+# Day 45-46 的完整实现额外支持：
+#   - 子串包含匹配（token in name）
+#   - 反向依赖查询（find_callers：谁调用了某符号）
+#   - 路径跨平台归一化（POSIX 正斜杠）
 # ============================================================
 
 
 class SymbolSearcher:
     """
-    基于 IndexService 内存符号表的精确 / 前缀匹配。
+    符号精确检索（委托给 SymbolExactMatcher）。
 
-    S5 第 43-44 天：仅作为 RRF 三路融合的"符号精确召回"输入源，
-    实现 Day 43-44 任务文档要求的"符号精确检索 Top-10"路径。
-
-    Day 45-46 将编写完整的 symbol_exact_matcher.py（含 Call Graph 反向依赖查询），
-    届时本类可委托给完整实现，或仅作为 fallback。
+    作为 RRF 三路融合的"符号精确召回"输入源，search() 委托给
+    symbol_exact_matcher.SymbolExactMatcher.search()，返回格式保持一致。
 
     匹配规则：
-      - 用户输入 #Tag（如 #DataProcessor）：精确匹配符号名
-      - 否则：从 query 中识别驼峰/下划线命名 token 做前缀匹配
-      - 精确命中得分 1.0，前缀命中得分 0.5（用于 RRF 内部排序）
+      - 用户输入 #Tag（如 #DataProcessor）：精确匹配符号名 → score=1.0
+      - 驼峰/下划线命名前缀匹配 → score=0.5
+      - 子串包含匹配（token 长度 >= 3）→ score=0.3
     """
-
-    # 识别 query 中的"标识符"token（驼峰/下划线/全大写缩写）
-    _IDENT_RE = __import__("re").compile(r"[A-Za-z_][A-Za-z0-9_]{1,}")
 
     def __init__(self, vector_store=None):
         self._vector_store = vector_store
+        self._matcher = None
 
-    def _get_store(self):
-        if self._vector_store is not None:
-            return self._vector_store
-        return get_vector_store()
+    def _get_matcher(self):
+        """惰性获取 SymbolExactMatcher 实例（注入 vector_store）"""
+        if self._matcher is None:
+            from .symbol_exact_matcher import SymbolExactMatcher
+            self._matcher = SymbolExactMatcher(vector_store=self._vector_store)
+        return self._matcher
 
     def search(self, query: str, top_k: int = 10) -> List[Dict[str, Any]]:
         """
         从用户 query 中识别符号 token，对 IndexService 内存符号表做精确 / 前缀匹配。
 
-        Args:
-            query:  用户查询文本（可能含 #Tag 或驼峰命名）
-            top_k:  返回前 K 个匹配
-
-        Returns:
-            候选列表，每项含 chunk_id/file_path/symbol_name/chunk_type/
-            content/start_line/end_line/score/source。content 通过 chunk_id
-            从 LanceDB 反查补全（保证与向量/BM25 路径格式一致）。
-            未命中或 LanceDB 中无对应 chunk 时返回空列表。
+        委托给 SymbolExactMatcher.search()，返回格式：
+          [{id, file_path, symbol_name, chunk_type, content,
+            start_line, end_line, score, source, match_type}, ...]
         """
-        if not query:
-            return []
+        return self._get_matcher().search(query, top_k=top_k)
 
-        # 1. 从 query 中提取候选符号 token
-        tokens = self._extract_symbol_tokens(query)
-        if not tokens:
-            return []
-
-        # 2. 遍历 IndexService 内存符号表，做精确 / 前缀匹配
-        try:
-            from .index_service import get_index_service
-            svc = get_index_service()
-        except Exception as e:
-            logger.debug(f"[SymbolSearcher] IndexService 不可用: {e}")
-            return []
-
-        # 收集 (file_path, symbol, match_type) 三元组
-        matches: List[Tuple[str, Any, str]] = []  # (file_path, Symbol, "exact"|"prefix")
-        # tokens 去重 + 大小写归一（保留原大小写用于精确匹配，但前缀匹配时大小写不敏感）
-        seen_tokens = set()
-        with svc._lock:
-            # 拷贝一份符号表引用，避免长时间持锁
-            file_tables = list(svc._index.items())
-
-        for file_path, table in file_tables:
-            for sym in table.symbols:
-                name = sym.name
-                if not name:
-                    continue
-                # 精确匹配（任一 token 命中即记一次，不重复）
-                for tok in tokens:
-                    key = (file_path, name, tok)
-                    if key in seen_tokens:
-                        continue
-                    if name == tok:
-                        matches.append((file_path, sym, "exact"))
-                        seen_tokens.add(key)
-                        break
-                    if name.lower() == tok.lower():
-                        matches.append((file_path, sym, "exact"))
-                        seen_tokens.add(key)
-                        break
-                else:
-                    # 前缀匹配（仅当未精确命中时）
-                    for tok in tokens:
-                        key = (file_path, name, tok, "prefix")
-                        if key in seen_tokens:
-                            continue
-                        if name.lower().startswith(tok.lower()) and len(tok) >= 2:
-                            matches.append((file_path, sym, "prefix"))
-                            seen_tokens.add(key)
-                            break
-
-        if not matches:
-            return []
-
-        # 3. 排序：精确 > 前缀；同类型按符号名长度升序（更短的更精准）
-        priority = {"exact": 0, "prefix": 1}
-        matches.sort(key=lambda x: (priority[x[2]], len(x[1].name)))
-        matches = matches[:top_k]
-
-        # 4. 计算 chunk_id，从 LanceDB 反查 chunk 元信息
-        chunk_ids = [
-            _compute_chunk_id(fp, sym.name, sym.start_line, sym.end_line)
-            for fp, sym, _ in matches
-        ]
-        try:
-            store = self._get_store()
-            if not store.is_table_exists():
-                return []
-            chunks = store.fetch_chunks_by_ids(chunk_ids)
-        except Exception as e:
-            logger.debug(f"[SymbolSearcher] LanceDB 反查 chunk 失败: {e}")
-            return []
-
-        # 5. 组装结果（带 score：exact=1.0, prefix=0.5）
-        chunks_by_id = {c["id"]: c for c in chunks}
-        results: List[Dict[str, Any]] = []
-        for (fp, sym, mtype), cid in zip(matches, chunk_ids):
-            chunk = chunks_by_id.get(cid)
-            if not chunk:
-                # LanceDB 中无对应 chunk（可能该符号未被切片/已删除），跳过
-                continue
-            results.append({
-                "id": cid,
-                "file_path": chunk.get("file_path", fp),
-                "symbol_name": chunk.get("symbol_name", sym.name),
-                "chunk_type": chunk.get("chunk_type", ""),
-                "content": chunk.get("content", ""),
-                "start_line": chunk.get("start_line", sym.start_line),
-                "end_line": chunk.get("end_line", sym.end_line),
-                "score": 1.0 if mtype == "exact" else 0.5,
-                "source": "symbol",
-            })
-        return results
-
-    @classmethod
-    def _extract_symbol_tokens(cls, query: str) -> List[str]:
+    @staticmethod
+    def _extract_symbol_tokens(query: str) -> List[str]:
         """
-        从 query 中提取符号候选 token。
-
-        规则：
-          - # 开头的标签：取 # 之后到下一个空白/非标识符字符之前的整段作为精确符号名
-          - 否则：用正则识别驼峰/下划线命名 token（长度 ≥ 2）
-          - 过滤掉常见英文停用词（"the"、"how" 等）避免误匹配
+        从 query 中提取符号候选 token（委托给 symbol_exact_matcher）。
+        保留此静态方法供 app/api/symbols.py 等模块复用。
         """
-        if not query:
-            return []
-        tokens: List[str] = []
-        # #Tag 提取
-        i = 0
-        while i < len(query):
-            if query[i] == "#":
-                j = i + 1
-                while j < len(query) and (query[j].isalnum() or query[j] == "_"):
-                    j += 1
-                if j > i + 1:
-                    tokens.append(query[i + 1:j])
-                i = j
-            else:
-                i += 1
-
-        # 普通标识符 token
-        for m in cls._IDENT_RE.findall(query):
-            if m and len(m) >= 2 and m.lower() not in _STOPWORDS_FOR_SYMBOL:
-                tokens.append(m)
-
-        # 去重保序
-        seen = set()
-        unique = []
-        for t in tokens:
-            if t not in seen:
-                seen.add(t)
-                unique.append(t)
-        return unique
-
-
-# 仅在符号检索时过滤的极简停用词（避免误把"how"/"the"当符号前缀）
-_STOPWORDS_FOR_SYMBOL = frozenset({
-    "the", "a", "an", "and", "or", "not", "is", "are", "was", "were",
-    "be", "been", "to", "of", "in", "on", "at", "by", "for", "with",
-    "how", "what", "where", "when", "why", "who", "which", "that",
-    "this", "these", "those", "do", "does", "did", "has", "have",
-    "can", "could", "should", "would", "will", "may", "might", "must",
-    "def", "class", "import", "from", "self", "true", "false", "none",
-    "null", "undefined", "function", "return", "var", "let", "const",
-    "public", "private", "protected", "static", "void", "int", "string",
-})
+        from .symbol_exact_matcher import extract_symbol_tokens
+        return extract_symbol_tokens(query)
 
 
 # ============================================================

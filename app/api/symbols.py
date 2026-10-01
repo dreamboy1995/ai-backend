@@ -1,35 +1,36 @@
 # app/api/symbols.py
-# S5 第 43-44 天：符号实时补全接口
+# S5 第 45-46 天：符号精确检索 & 依赖图增强接口
 # - GET /v1/symbols/search?q=<前缀>&limit=<数量>
+#     符号实时补全（用户输入 # 后调用，300ms 内弹出候选）
+# - GET /v1/symbols/callers?name=<符号名>&limit=<数量>
+#     反向依赖查询：谁调用了指定符号（利用 S4 Call Graph）
+# - GET /v1/symbols/definition?name=<符号名>
+#     精确定位符号定义（file_path + 行号范围）
 #
-# 用户在 Chat UI 中输入 # 后调用本接口，实时弹出匹配的符号名
-# （如输入"Da"返回 DataProcessor / DatabaseConnector）。
-# 验收要求：300ms 内弹出候选列表。
-#
-# 复用 fusion_reranker.SymbolSearcher 的精确/前缀匹配能力，
-# Day 45-46 编写完整的 symbol_exact_matcher.py 后可改为委托。
+# 委托给 symbol_exact_matcher.SymbolExactMatcher 实现。
 
 import logging
 
 from fastapi import APIRouter, HTTPException, Query
 
 from app.config import settings
-from app.models.schemas import SymbolItem, SymbolSearchResponse
-from app.services.code_index.fusion_reranker import SymbolSearcher
-from app.services.code_index.index_service import get_index_service
+from app.models.schemas import (
+    SymbolCallerItem,
+    SymbolCallersResponse,
+    SymbolDefinitionResponse,
+    SymbolItem,
+    SymbolSearchResponse,
+)
+from app.services.code_index.symbol_exact_matcher import get_symbol_exact_matcher
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# 复用 SymbolSearcher 的 token 提取与前缀匹配能力，
-# 但本接口不需要从 LanceDB 反查 chunk content，直接走 IndexService 符号表
-_symbol_searcher = SymbolSearcher()
-
 
 @router.get("/search", response_model=SymbolSearchResponse)
 async def search_symbols(
-    q: str = Query(..., min_length=1, description="符号名前缀或完整名（如 Da / DataProcessor）"),
+    q: str = Query("", description="符号名前缀或完整名（如 Da / DataProcessor / #DataProcessor）。为空时返回空列表。"),
     limit: int = Query(
         default=settings.SYMBOL_SEARCH_TOP_K,
         ge=1,
@@ -47,66 +48,73 @@ async def search_symbols(
       4. 返回 [{name, type, file_path, line}, ...]
 
     验收：输入"#Da"应在 300ms 内返回 DataProcessor 和 DatabaseConnector。
+    注意：q 为空时返回空列表（HTTP 200），避免前端清空输入框时触发 422。
     """
-    svc = get_index_service()
-
-    tokens = SymbolSearcher._extract_symbol_tokens(q)
-    if not tokens:
-        # 没有可识别的 token（如纯数字/标点），直接返回空
+    matcher = get_symbol_exact_matcher()
+    if not q:
         return SymbolSearchResponse(query=q, limit=limit, total=0, symbols=[])
+    symbols = matcher.suggest_symbols(q, limit=limit)
+    return SymbolSearchResponse(
+        query=q,
+        limit=limit,
+        total=len(symbols),
+        symbols=[SymbolItem(**s) for s in symbols],
+    )
 
-    matches = []  # [(file_path, Symbol, "exact"|"prefix")]
-    seen_keys = set()
 
-    with svc._lock:
-        file_tables = list(svc._index.items())
+@router.get("/definition", response_model=SymbolDefinitionResponse)
+async def get_symbol_definition(
+    name: str = Query(..., min_length=1, description="符号名（如 DataProcessor / save）"),
+):
+    """
+    精确定位符号定义。
 
-    for file_path, table in file_tables:
-        for sym in table.symbols:
-            name = sym.name
-            if not name:
-                continue
-            # 精确匹配（任一 token 命中即记一次，不重复）
-            for tok in tokens:
-                key = (file_path, name, tok)
-                if key in seen_keys:
-                    continue
-                if name == tok or name.lower() == tok.lower():
-                    matches.append((file_path, sym, "exact"))
-                    seen_keys.add(key)
-                    break
-            else:
-                # 前缀匹配（仅当未精确命中时）
-                for tok in tokens:
-                    key = (file_path, name, tok, "prefix")
-                    if key in seen_keys:
-                        continue
-                    if (
-                        name.lower().startswith(tok.lower())
-                        and len(tok) >= 1
-                    ):
-                        matches.append((file_path, sym, "prefix"))
-                        seen_keys.add(key)
-                        break
+    用于验收场景："输入 #DataProcessor，后端能直接定位到定义该类的文件路径和行号范围"。
 
-    if not matches:
-        return SymbolSearchResponse(query=q, limit=limit, total=0, symbols=[])
-
-    priority = {"exact": 0, "prefix": 1}
-    matches.sort(key=lambda x: (priority[x[2]], len(x[1].name)))
-    matches = matches[:limit]
-
-    items = [
-        SymbolItem(
-            name=sym.name,
-            type=(
-                sym.symbol_type.value
-                if hasattr(sym.symbol_type, "value")
-                else str(sym.symbol_type)
-            ),
-            file_path=file_path,
-            line=sym.start_line,
+    仅做精确匹配（name 完全相等，大小写不敏感），返回第一个命中的符号。
+    """
+    matcher = get_symbol_exact_matcher()
+    result = matcher.get_symbol_definition(name)
+    if not result:
+        raise HTTPException(
+            status_code=404,
+            detail=f"未找到符号 '{name}' 的定义，请先调用 POST /v1/index/start 触发索引",
         )
-        for file_path, sym, _ in matches
-    ]
-    return SymbolSearchResponse(query=q, limit=limit, total=len(items), symbols=items)
+    return SymbolDefinitionResponse(
+        name=result["name"],
+        type=result["type"],
+        file_path=result["file_path"],
+        start_line=result["start_line"],
+        end_line=result["end_line"],
+    )
+
+
+@router.get("/callers", response_model=SymbolCallersResponse)
+async def get_symbol_callers(
+    name: str = Query(..., min_length=1, description="被调用的符号名（如 save / format_data）"),
+    limit: int = Query(
+        default=20,
+        ge=1,
+        le=100,
+        description="返回调用记录数量上限",
+    ),
+):
+    """
+    反向依赖查询：谁调用了指定符号。
+
+    利用 S4 构建的 Call Graph（DependencyGraph），遍历所有 call 边，
+    找出 target 匹配 symbol_name 的调用记录。
+
+    匹配规则：
+      - target == name（精确，如 "save"）
+      - target 以 "." + name 结尾（如 "obj.save"、"utils.save" 匹配 "save"）
+
+    验收场景：输入 "谁调用了 save()"，返回 main.py 第 15 行和 utils.py 第 88 行。
+    """
+    matcher = get_symbol_exact_matcher()
+    callers = matcher.find_callers(name, top_k=limit)
+    return SymbolCallersResponse(
+        symbol_name=name,
+        total=len(callers),
+        callers=[SymbolCallerItem(**c) for c in callers],
+    )
