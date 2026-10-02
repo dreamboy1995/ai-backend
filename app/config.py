@@ -59,7 +59,7 @@ class Settings(BaseSettings):
     #   - "local"  : 使用本地 sentence-transformers 模型（all-MiniLM-L6-v2，384 维）
     #   - "remote" : 调用远程 Embedding API（OpenAI text-embedding-3-small，1536 维）
     #   - "auto"   : 优先本地，加载失败或过慢时自动降级到远程
-    EMBEDDING_MODE: str = "auto"
+    EMBEDDING_MODE: str = "local"
     EMBEDDING_LOCAL_MODEL: str = "all-MiniLM-L6-v2"   # 本地模型名（~80MB，CPU 可跑）
     # 本地模型加载超时（秒）。首次运行需从 HuggingFace 下载模型（~80MB），
     # 故默认设为 120s；模型缓存后加载通常 < 3s。
@@ -140,6 +140,26 @@ class Settings(BaseSettings):
     RERANK_MAX_CANDIDATES: int = 10
     # 是否启用重排序（False 时仅走 RRF，跳过 Cross-Encoder，用于压测/降级）
     RERANK_ENABLED: bool = True
+
+    # S5 第 47-48 天：智能上下文组装器配置
+    # 上下文组装器对 hybrid_search 召回的 Top-K Chunk 做智能压缩与 Token 预算控制。
+    #
+    # 动态 Token 预算（S5 风险预警：token 预算不能写死，必须根据模型动态调整）：
+    #   组装器预算 = min(model_context_window * CONTEXT_ASSEMBLY_FILL_RATIO,
+    #                    CONTEXT_ASSEMBLY_MAX_BUDGET)
+    #   - fill_ratio=0.7：留 30% 给对话历史和模型输出（S5 风险预警建议）
+    #   - max_budget=8000：硬上限，避免超大模型下上下文膨胀导致推理变慢/成本飙升
+    #   若模型上下文窗口未知（不在 MODEL_REGISTRY 中），则回退到 CONTEXT_ASSEMBLY_DEFAULT_BUDGET。
+    CONTEXT_ASSEMBLY_FILL_RATIO: float = 0.7
+    CONTEXT_ASSEMBLY_MAX_BUDGET: int = 8000
+    CONTEXT_ASSEMBLY_DEFAULT_BUDGET: int = 8000
+    # 光标所在文件的 Chunk 权重加成（+30%），让用户正在编辑的文件相关片段排在前面
+    CONTEXT_ASSEMBLY_CURSOR_BOOST: float = 0.3
+    # 压缩阈值：函数/类 Chunk 行数超过该值时触发智能压缩（保留签名+注释+头尾）
+    CONTEXT_ASSEMBLY_COMPRESS_LINES: int = 100
+    # 压缩时保留的头部行数 / 尾部行数
+    CONTEXT_ASSEMBLY_HEAD_LINES: int = 10
+    CONTEXT_ASSEMBLY_TAIL_LINES: int = 10
 
     model_config = SettingsConfigDict(
         env_file=".env",

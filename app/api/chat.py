@@ -18,6 +18,7 @@ from app.services.llm import (
 )
 from app.services.session import get_session_service, count_tokens
 from app.services.context_builder import ContextBuilder
+from app.services.code_index.context_assembler import get_context_assembler
 from app.services.quota import get_quota_service
 from app.middlewares.request_id import get_request_id, REQUEST_ID_HEADER
 from app.auth import get_current_user
@@ -59,39 +60,6 @@ def _extract_last_user_query(messages: List) -> str:
     return last_user or ""
 
 
-def _build_retrieval_context_items(
-    chunks: List[dict],
-    existing_contexts: List[ContextItem],
-) -> List[ContextItem]:
-    """
-    将 hybrid_search 输出的 chunks 转为 ContextItem（type='implicit'）。
-
-    去重：与用户主动 @ 的 file/selection 不重复（按 file_path + 行号范围去重）。
-    截断：每个 chunk content 已由向量库存储为切片原文，无需再截断。
-    """
-    existing_keys = {
-        (c.file_path, c.content_snippet[:50]) for c in existing_contexts
-    }
-    items: List[ContextItem] = []
-    for ch in chunks:
-        fp = ch.get("file_path", "")
-        content = ch.get("content", "")
-        if not fp or not content:
-            continue
-        # 去重：同文件 + 内容前 50 字符相同的视为已存在
-        key = (fp, content[:50])
-        if key in existing_keys:
-            continue
-        existing_keys.add(key)
-        items.append(ContextItem(
-            type="implicit",
-            file_path=fp,
-            content_snippet=content,
-            language=_detect_language(fp),
-        ))
-    return items
-
-
 def _detect_language(file_path: str) -> Optional[str]:
     """根据扩展名简单识别语言（供 ContextBuilder 代码块语言标签用）"""
     if not file_path:
@@ -109,22 +77,6 @@ def _detect_language(file_path: str) -> Optional[str]:
         if lower.endswith(ext):
             return lang
     return None
-
-
-def _build_reference_items(chunks: List[dict]) -> List[ReferenceItem]:
-    """将 hybrid_search 输出转为 SSE references 元数据块条目"""
-    items: List[ReferenceItem] = []
-    for ch in chunks:
-        start = ch.get("start_line", 0)
-        end = ch.get("end_line", 0)
-        lines = f"{start}-{end}" if start and end and start != end else str(start or end)
-        items.append(ReferenceItem(
-            file=ch.get("file_path", ""),
-            lines=lines,
-            score=float(ch.get("score", 0.0)),
-            symbol=ch.get("symbol_name", ""),
-        ))
-    return items
 
 
 def _extract_system_content(messages: List[dict]) -> tuple:
@@ -198,9 +150,27 @@ async def chat_completions(
     # ------------------------------------------------------------------
     # S5 第 43-44 天：自动上下文检索（retrieval_config.auto_context）
     # 用 hybrid_search（向量+BM25+符号+RRF+Cross-Encoder）检索 Top-K chunk，
+    # 再经 S5 第 47-48 天 ContextAssembler 做智能压缩 + 动态 Token 预算控制，
     # 转为 implicit ContextItem 注入 System Prompt。
     # 检索失败/无结果时静默跳过，不阻断对话流程。
     # ------------------------------------------------------------------
+    # 光标所在文件：从请求的 implicit 上下文中提取（用户当前打开的文件），
+    # 供 ContextAssembler 做位置权重打分（光标文件 Chunk +30%）。
+    cursor_file: Optional[str] = None
+    for c in request.contexts or []:
+        if c.type == "implicit":
+            cursor_file = c.file_path
+            break
+
+    # 模型上下文窗口：用于动态 Token 预算（S5 风险预警：预算不能写死）
+    model_context_window: Optional[int] = None
+    try:
+        model_info = AdapterFactory.get_model_info(model_id)
+        if model_info is not None:
+            model_context_window = model_info.context_window
+    except Exception:
+        model_context_window = None
+
     retrieval_config = request.retrieval_config
     retrieved_chunks: List[dict] = []
     references_to_send: List[ReferenceItem] = []
@@ -215,17 +185,38 @@ async def chat_completions(
                     include_meta=False,
                 )
                 if retrieved_chunks:
-                    # 追加为 implicit 上下文（已与用户主动 @ 的去重）
-                    retrieval_items = _build_retrieval_context_items(
-                        retrieved_chunks, contexts
+                    # S5 第 47-48 天：智能上下文组装
+                    # 位置权重打分 + 智能压缩 + 动态 Token 预算 + 低分丢弃
+                    assembler = get_context_assembler()
+                    asm_result = assembler.assemble(
+                        chunks=retrieved_chunks,
+                        cursor_file=cursor_file,
+                        model_context_window=model_context_window,
                     )
-                    contexts.extend(retrieval_items)
+                    # 与用户主动 @ 的上下文去重（按 file_path + 内容前 50 字符）
+                    existing_keys = {
+                        (c.file_path, c.content_snippet[:50]) for c in contexts
+                    }
+                    dedup_items: List[ContextItem] = []
+                    for item in asm_result.contexts:
+                        key = (item.file_path, item.content_snippet[:50])
+                        if key in existing_keys:
+                            continue
+                        existing_keys.add(key)
+                        dedup_items.append(item)
+                    contexts.extend(dedup_items)
+
                     if retrieval_config.include_references:
-                        references_to_send = _build_reference_items(retrieved_chunks)
+                        references_to_send = asm_result.references
                     logger.info(
                         f"[Chat] 自动检索注入: query='{query_text[:40]}...', "
-                        f"召回 {len(retrieved_chunks)} 个片段, "
-                        f"去重后追加 {len(retrieval_items)} 个 implicit 上下文, "
+                        f"召回 {len(retrieved_chunks)} 个片段 → "
+                        f"组装保留 {asm_result.stats.kept_chunks} 个 "
+                        f"(压缩 {asm_result.stats.compressed_chunks}, "
+                        f"丢弃 {asm_result.stats.dropped_chunks}), "
+                        f"去重后追加 {len(dedup_items)} 个 implicit 上下文, "
+                        f"tokens {asm_result.stats.original_tokens}→{asm_result.stats.compressed_tokens} "
+                        f"(预算 {asm_result.stats.token_budget}), "
                         f"references={len(references_to_send)}"
                     )
         except Exception as e:
