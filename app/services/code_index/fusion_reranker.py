@@ -558,6 +558,40 @@ class FusionReranker:
         if top_k is None:
             top_k = self.hybrid_top_k
 
+        # S5 第 49-50 天：检索结果缓存 + Singleflight 防击穿
+        # 仅对 include_meta=False 的常规检索缓存（chat.py 路径）。
+        # get_or_compute 内部：查缓存 → 命中直接返回；未命中时获取 per-key 锁，
+        # 双重检查后执行 compute_fn 并写入缓存。高并发下同一 Query 只计算一次，
+        # 其余并发请求等待结果，避免 Embedding + Rerank 重复计算导致延迟飙升。
+        if not include_meta:
+            try:
+                from .retrieval_cache import get_retrieval_cache, make_cache_key
+                cache = get_retrieval_cache()
+                cache_key = make_cache_key(query, top_k)
+
+                def _do_search():
+                    return self._hybrid_search_impl(query, top_k, include_meta)
+
+                return cache.get_or_compute(cache_key, _do_search)
+            except Exception as e:
+                logger.debug(
+                    f"[FusionReranker] 检索缓存层异常（降级为直接检索）: {e}"
+                )
+
+        return self._hybrid_search_impl(query, top_k, include_meta)
+
+    def _hybrid_search_impl(
+        self,
+        query: str,
+        top_k: int,
+        include_meta: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """
+        hybrid_search 的实际检索实现（不含缓存逻辑）。
+
+        流程：三路召回 -> RRF 融合 -> 补全 content -> Cross-Encoder 重排序 -> 输出。
+        被 get_or_compute 作为 compute_fn 调用，或在缓存禁用/异常时直接调用。
+        """
         # 1. 三路召回
         vector_results = self._vector_search(query, self.vector_top_k)
         bm25_results = self._bm25_search(query, self.bm25_top_k)

@@ -67,6 +67,7 @@ def get_redis_async():
             socket_connect_timeout=2.0,
             socket_timeout=2.0,
             retry_on_timeout=True,
+            protocol=2,  # 兼容 Redis 3.x（避免 HELLO 命令不支持）
         )
         _redis_available = True
         logger.info(f"[RedisClient] 异步 Redis 客户端已初始化: {settings.REDIS_URL}")
@@ -106,6 +107,7 @@ def get_redis_sync():
             decode_responses=True,
             socket_connect_timeout=2.0,
             socket_timeout=2.0,
+            protocol=2,  # 兼容 Redis 3.x（避免 HELLO 命令不支持）
         )
         _redis_available = True
         logger.info(f"[RedisClient] 同步 Redis 客户端已初始化: {settings.REDIS_URL}")

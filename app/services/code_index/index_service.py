@@ -26,7 +26,7 @@ import os
 import threading
 import time
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Dict, List, Optional
 
 from .ast_parser import parse_file
@@ -38,6 +38,33 @@ from .parser_factory import is_supported
 from .vector_store import get_vector_store
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# S5 第 49-50 天：跨平台路径归一化
+#
+# os.path.relpath 在 Windows 下返回反斜杠路径（src\\main.py），
+# 在 Linux/macOS 下返回正斜杠（src/main.py）。为保证 LanceDB / BM25 /
+# 依赖图 / 符号表中存储的路径格式一致，统一在源头（索引入口）转为
+# POSIX 正斜杠相对路径，下游所有模块无需再做分隔符适配。
+# ============================================================
+
+def to_posix_relpath(path: str) -> str:
+    """
+    将任意相对路径统一转为 POSIX 正斜杠格式。
+
+    使用 pathlib.PurePosixPath 做分隔符转换（不解析 .. / .），
+    确保 Windows 反斜杠路径也能正确归一化为 src/main.py。
+
+    Args:
+        path: 任意格式的相对路径（可能含反斜杠）
+
+    Returns:
+        POSIX 风格的相对路径（正斜杠分隔）
+    """
+    if not path:
+        return path
+    return PurePosixPath(path.replace("\\", "/")).as_posix()
 
 # 索引时跳过的目录
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build", ".idea", ".vscode"}
@@ -185,7 +212,10 @@ class IndexService:
                 # 仅处理支持的语言
                 if not is_supported(full_path):
                     continue
-                rel_path = os.path.relpath(full_path, workspace_root)
+                # S5 第 49-50 天：统一转为 POSIX 正斜杠相对路径，
+                # 避免 Windows 反斜杠与 Linux 正斜杠不一致导致下游
+                #（LanceDB/BM25/依赖图/符号表）存储格式混乱。
+                rel_path = to_posix_relpath(os.path.relpath(full_path, workspace_root))
                 files.append(rel_path)
 
         return files
@@ -292,6 +322,8 @@ class IndexService:
                     get_bm25_index().clear()
                 except Exception as e:
                     logger.warning(f"[IndexService] 清空 BM25 索引失败: {e}")
+                # S5 第 49-50 天：强制重建时清空检索缓存
+                self._invalidate_retrieval_cache()
         except Exception as e:
             logger.warning(f"[IndexService] 向量库初始化失败，索引将跳过向量化: {e}")
 
@@ -305,6 +337,10 @@ class IndexService:
                 dep_graph.clear()
 
         # 2. 重排文件：priority_files 优先
+        # S5 第 49-50 天：priority_files 由插件传入，可能含 Windows 反斜杠，
+        # 统一归一化为 POSIX 正斜杠，确保与 _scan_files 输出的 files 能正确匹配。
+        if priority_files:
+            priority_files = [to_posix_relpath(f) for f in priority_files]
         ordered_files = self._reorder_priority(files, priority_files)
         logger.info(f"[IndexService] 开始索引 {len(ordered_files)} 个文件")
 
@@ -521,6 +557,11 @@ class IndexService:
         root = workspace_root or self.workspace_root or os.getcwd()
         dep_graph = get_dependency_graph()
 
+        # S5 第 49-50 天：插件传入的 file_path 可能含 Windows 反斜杠，
+        # 统一归一化为 POSIX 正斜杠，与 _scan_files 的全量索引保持一致，
+        # 避免 delete_by_file / 符号表查找因分隔符不同而匹配失败。
+        file_path = to_posix_relpath(file_path)
+
         if action == "deleted":
             with self._lock:
                 removed = self._index.pop(file_path, None)
@@ -542,6 +583,8 @@ class IndexService:
                 get_bm25_index().mark_dirty()
             except Exception as e:
                 logger.warning(f"[IndexService] 标记 BM25 索引失败: {e}")
+            # S5 第 49-50 天：索引变更后清空检索缓存，避免返回过期结果
+            self._invalidate_retrieval_cache()
             return {
                 "success": True,
                 "message": f"已删除 {file_path} 的索引",
@@ -578,11 +621,27 @@ class IndexService:
         except Exception as e:
             logger.warning(f"[IndexService] 标记 BM25 索引失败: {e}")
 
+        # S5 第 49-50 天：索引变更后清空检索缓存，避免返回过期结果
+        self._invalidate_retrieval_cache()
+
         return {
             "success": True,
             "message": f"已更新 {file_path} 的索引",
             "symbols_count": len(table.symbols),
         }
+
+    def _invalidate_retrieval_cache(self) -> None:
+        """
+        S5 第 49-50 天：清空检索结果缓存。
+
+        索引变更（文件增删改）后调用，避免 hybrid_search 返回过期的检索结果。
+        失败时仅记录日志，不中断索引流程。
+        """
+        try:
+            from .retrieval_cache import get_retrieval_cache
+            get_retrieval_cache().invalidate()
+        except Exception as e:
+            logger.warning(f"[IndexService] 清空检索缓存失败: {e}")
 
     def _index_single_file_to_store(
         self, full_path: str, rel_path: str, table: SymbolTable

@@ -141,6 +141,14 @@ class Settings(BaseSettings):
     # 是否启用重排序（False 时仅走 RRF，跳过 Cross-Encoder，用于压测/降级）
     RERANK_ENABLED: bool = True
 
+    # S5 第 49-50 天：检索结果缓存（Redis + 内存降级）
+    # 对 hybrid_search 结果做缓存，降低重复查询压力。
+    # 缓存键 = retrieval:{top_k}:{normalize_query(query)}，TTL 5 分钟。
+    # Redis 不可用时自动降级为内存 OrderedDict（LRU + TTL）。
+    # 索引更新（文件增删改）时调用 RetrievalCache.invalidate() 清空缓存。
+    RETRIEVAL_CACHE_ENABLED: bool = True
+    RETRIEVAL_CACHE_TTL_SECONDS: int = 300  # 5 分钟
+
     # S5 第 47-48 天：智能上下文组装器配置
     # 上下文组装器对 hybrid_search 召回的 Top-K Chunk 做智能压缩与 Token 预算控制。
     #
