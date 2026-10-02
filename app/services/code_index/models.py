@@ -61,6 +61,18 @@ class Symbol:
         d["symbol_type"] = self.symbol_type.value
         return d
 
+    @staticmethod
+    def from_dict(data: dict) -> "Symbol":
+        """从字典反序列化 Symbol（符号表持久化恢复用）"""
+        return Symbol(
+            name=data["name"],
+            symbol_type=SymbolType(data["symbol_type"]),
+            file_path=data["file_path"],
+            start_line=int(data["start_line"]),
+            end_line=int(data["end_line"]),
+            content=data.get("content"),
+        )
+
 
 @dataclass
 class SymbolTable:
@@ -71,17 +83,30 @@ class SymbolTable:
         file_path: 文件路径
         language:  识别出的语言（python / javascript / typescript / java / go / unknown）
         symbols:   符号列表
+        mtime:     索引时文件的修改时间戳（秒），用于持久化恢复时的陈旧校验
     """
     file_path: str
     language: str
     symbols: List[Symbol] = field(default_factory=list)
+    mtime: float = 0.0
 
     def to_dict(self) -> dict:
         return {
             "file_path": self.file_path,
             "language": self.language,
+            "mtime": self.mtime,
             "symbols": [s.to_dict() for s in self.symbols],
         }
+
+    @staticmethod
+    def from_dict(data: dict) -> "SymbolTable":
+        """从字典反序列化 SymbolTable（符号表持久化恢复用）"""
+        return SymbolTable(
+            file_path=data["file_path"],
+            language=data.get("language", "unknown"),
+            mtime=float(data.get("mtime", 0.0)),
+            symbols=[Symbol.from_dict(s) for s in data.get("symbols", [])],
+        )
 
     @property
     def functions(self) -> List[Symbol]:

@@ -120,6 +120,21 @@ def _get_graph_persist_path(workspace_root: str) -> str:
     return os.path.join(workspace_root, rel)
 
 
+def _get_symbols_file() -> Optional[str]:
+    """符号表持久化文件路径（相对工作区根目录）"""
+    try:
+        from app.config import settings
+        return settings.SYMBOLS_FILE
+    except Exception:
+        return ".ai_index/symbols.json"
+
+
+def _get_symbols_persist_path(workspace_root: str) -> str:
+    """符号表持久化文件的绝对路径"""
+    rel = _get_symbols_file() or ".ai_index/symbols.json"
+    return os.path.join(workspace_root, rel)
+
+
 class IndexService:
     """
     索引服务单例，管理全量/增量索引状态与流程。
@@ -262,6 +277,30 @@ class IndexService:
             self.workspace_root = workspace_root
             if force_rebuild:
                 self._index.clear()
+
+        # 非强制重建时，优先从 .ai_index/symbols.json 恢复内存符号表，
+        # 同时恢复依赖图（dependency_graph.json），确保 /v1/symbols/callers 等
+        # 依赖图的接口在后端重启后也能正常工作。
+        # 若恢复成功（符号数 > 0），直接置为 done，跳过全量重索引，
+        # 解决后端重启后符号表丢失、插件因标记存在而不触发重索引的问题。
+        if not force_rebuild:
+            restored = self._load_symbols(workspace_root)
+            if restored > 0:
+                # 同步恢复依赖图（与符号表配套，避免 callers 接口返回空）
+                try:
+                    dep_graph = get_dependency_graph()
+                    dep_graph.load(_get_graph_persist_path(workspace_root))
+                except Exception as e:
+                    logger.warning(f"[IndexService] 快速恢复时加载依赖图失败: {e}")
+                with self._lock:
+                    self.total = len(self._index)
+                    self.processed = self.total
+                self._write_progress_to_redis()
+                logger.info(
+                    f"[IndexService] 符号表快速恢复成功，跳过全量索引 "
+                    f"job_id={self.job_id} symbols={restored}"
+                )
+                return {"job_id": self.job_id, "total_files": self.total, "restored": True}
 
         # 前台快速扫描文件列表，用于立即返回 total_files
         # （扫描本身不做解析/向量化，对 100 文件仓库通常 < 1s）
@@ -422,6 +461,8 @@ class IndexService:
             self.message = f"索引完成，共 {self.total_symbols} 个符号"
         self._write_progress_to_redis()
         self._write_index_marker(workspace_root)
+        # 持久化符号表，供后端重启后恢复
+        self._save_symbols(workspace_root)
         logger.info(f"[IndexService] 索引完成 job_id={self.job_id} symbols={self.total_symbols}")
 
     @staticmethod
@@ -522,6 +563,117 @@ class IndexService:
         except Exception as e:
             logger.warning(f"[IndexService] 写入索引标记文件失败: {e}")
 
+    # ============================================================
+    # 符号表持久化与恢复
+    #
+    # 问题：IndexService._index（内存符号表）在后端重启后丢失，
+    #       导致 /v1/symbols/search 返回空，即使磁盘上 dependency_graph.json
+    #       与 indexed.json 标记都存在。
+    # 方案：将符号表序列化到 .ai_index/symbols.json，索引完成/增量更新时写入，
+    #       启动时从该文件恢复（含 mtime 陈旧校验，文件变更则跳过该表）。
+    # ============================================================
+
+    def _save_symbols(self, workspace_root: str) -> None:
+        """
+        将内存符号表持久化到 .ai_index/symbols.json。
+
+        在全量索引完成后与每次增量更新后调用，确保磁盘数据与内存一致。
+        失败仅记录日志，不中断索引流程。
+        """
+        try:
+            with self._lock:
+                tables = [t.to_dict() for t in self._index.values()]
+                total = self.total_symbols
+            payload = {
+                "version": 1,
+                "saved_at": time.time(),
+                "workspace_root": workspace_root,
+                "total_symbols": total,
+                "tables": tables,
+            }
+            path = _get_symbols_persist_path(workspace_root)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+            logger.debug(
+                f"[IndexService] 符号表已持久化: {path} "
+                f"({len(tables)} 文件, {total} 符号)"
+            )
+        except Exception as e:
+            logger.warning(f"[IndexService] 符号表持久化失败: {e}")
+
+    def _load_symbols(self, workspace_root: str) -> int:
+        """
+        从 .ai_index/symbols.json 恢复内存符号表。
+
+        恢复策略：
+          1. 读取 symbols.json，反序列化每个 SymbolTable
+          2. 对每个表做 mtime 校验：若磁盘文件 mtime 与持久化时不一致，
+             说明文件在索引后被修改，跳过该表（不加载陈旧数据），
+             由后续增量更新或重新索引补全。
+          3. 将有效表装入 self._index，更新 total_symbols / workspace_root / status
+
+        Args:
+            workspace_root: 工作区根路径
+
+        Returns:
+            成功恢复的符号总数（0 表示无持久化文件或全部陈旧）
+        """
+        path = _get_symbols_persist_path(workspace_root)
+        if not os.path.exists(path):
+            logger.debug(f"[IndexService] 符号表持久化文件不存在，跳过恢复: {path}")
+            return 0
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            logger.warning(f"[IndexService] 读取符号表持久化文件失败: {e}")
+            return 0
+
+        tables_data = data.get("tables", [])
+        loaded_index: Dict[str, SymbolTable] = {}
+        loaded_symbols = 0
+        stale_count = 0
+
+        for td in tables_data:
+            rel_path = td.get("file_path", "")
+            if not rel_path:
+                continue
+            table = SymbolTable.from_dict(td)
+
+            # mtime 陈旧校验：文件在索引后被修改则跳过，避免加载过期符号
+            full_path = os.path.join(workspace_root, rel_path)
+            try:
+                current_mtime = os.path.getmtime(full_path)
+                if table.mtime and abs(current_mtime - table.mtime) > 1e-6:
+                    stale_count += 1
+                    logger.debug(
+                        f"[IndexService] 符号表跳过（文件已变更）: {rel_path}"
+                    )
+                    continue
+            except OSError:
+                # 文件不存在（可能被删除），跳过
+                stale_count += 1
+                continue
+
+            loaded_index[rel_path] = table
+            loaded_symbols += len(table.symbols)
+
+        with self._lock:
+            self._index = loaded_index
+            self.total_symbols = loaded_symbols
+            self.workspace_root = workspace_root
+            self.status = "done"
+            self.message = f"索引已从磁盘恢复，共 {loaded_symbols} 个符号"
+
+        logger.info(
+            f"[IndexService] 符号表从磁盘恢复完成: "
+            f"{len(loaded_index)} 文件, {loaded_symbols} 符号, "
+            f"跳过 {stale_count} 个陈旧文件"
+        )
+        return loaded_symbols
+
     def wait_for_done(self, timeout: float = 60.0) -> bool:
         """
         等待后台索引线程完成（测试用）。
@@ -585,6 +737,8 @@ class IndexService:
                 logger.warning(f"[IndexService] 标记 BM25 索引失败: {e}")
             # S5 第 49-50 天：索引变更后清空检索缓存，避免返回过期结果
             self._invalidate_retrieval_cache()
+            # 增量更新后同步持久化符号表
+            self._save_symbols(root)
             return {
                 "success": True,
                 "message": f"已删除 {file_path} 的索引",
@@ -623,6 +777,8 @@ class IndexService:
 
         # S5 第 49-50 天：索引变更后清空检索缓存，避免返回过期结果
         self._invalidate_retrieval_cache()
+        # 增量更新后同步持久化符号表
+        self._save_symbols(root)
 
         return {
             "success": True,

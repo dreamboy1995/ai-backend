@@ -93,6 +93,10 @@ class Settings(BaseSettings):
     # MVP 阶段采用 JSON 文件 + 内存缓存，避免引入 Neo4j 中间件
     # 全量索引结束后整体持久化；增量更新时局部修改后重新持久化
     DEPENDENCY_GRAPH_FILE: str = ".ai_index/dependency_graph.json"
+    # 符号表持久化文件路径（相对工作区根目录）
+    # 解决后端重启后内存符号表丢失导致 /v1/symbols/search 返回空的问题。
+    # 索引完成后整体持久化；增量更新时重新写入；启动时从该文件恢复（含 mtime 陈旧校验）。
+    SYMBOLS_FILE: str = ".ai_index/symbols.json"
     # 依赖图 BFS 查询默认深度（GET /v1/graph/related?depth=...）
     GRAPH_DEFAULT_DEPTH: int = 2
     # 依赖图 BFS 查询最大深度（防止全图遍历）

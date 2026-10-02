@@ -14,6 +14,7 @@ AST 解析器（S4 第 31-32 天）
 """
 
 import logging
+import os
 import re
 from typing import List, Optional
 
@@ -426,6 +427,11 @@ def parse_file(file_path: str, use_fallback_on_error: bool = True) -> SymbolTabl
         with open(file_path, "r", encoding="utf-8", errors="replace") as f:
             source_text = f.read()
         source_bytes = source_text.encode("utf-8")
+        # 记录文件 mtime，供符号表持久化恢复时做陈旧校验
+        try:
+            table.mtime = os.path.getmtime(file_path)
+        except OSError:
+            table.mtime = 0.0
     except Exception as e:
         logger.warning(f"[ASTParser] 读取文件失败 {file_path}: {e}")
         return table
