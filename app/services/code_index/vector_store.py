@@ -168,11 +168,19 @@ class VectorStore:
             return None
 
     def _get_table(self) -> lancedb.table.Table:
-        """获取已打开的表；未建表时抛异常"""
+        """获取已打开的表；若内存中未持有但磁盘上已存在则自动打开。"""
         if self._table is None:
-            raise RuntimeError(
-                "向量表尚未创建，请先调用 create_table(vector_dim)"
-            )
+            # 跨进程/单例未初始化场景：表已由索引进程建好在磁盘上，
+            # 此处自动打开复用，避免调用方必须先调用 create_table()。
+            db = self._connect()
+            if self.table_name in db.table_names():
+                self._table = db.open_table(self.table_name)
+                self._vector_dim = self._read_vector_dim(self._table)
+                logger.debug(f"[VectorStore] 自动打开已存在表 '{self.table_name}'")
+            else:
+                raise RuntimeError(
+                    "向量表尚未创建，请先调用 create_table(vector_dim)"
+                )
         return self._table
 
     # ============================================================

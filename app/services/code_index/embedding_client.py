@@ -154,6 +154,12 @@ class LocalEmbeddingBackend:
 
         def _load():
             try:
+                # S5 修复：强制 HuggingFace 离线模式，避免 sentence-transformers
+                # 加载本地缓存模型时联网检查元数据导致超时（网络受限环境下 120s 不够）。
+                # 模型已缓存于 ~/.cache/huggingface/hub/，离线加载 7s 内完成。
+                import os
+                os.environ.setdefault("HF_HUB_OFFLINE", "1")
+                os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
                 from sentence_transformers import SentenceTransformer
                 result["model"] = SentenceTransformer(self.model_name)
             except Exception as e:

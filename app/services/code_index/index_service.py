@@ -329,7 +329,12 @@ class IndexService:
                     self.total_symbols += len(table.symbols)
 
                 # 切片并加入批次缓冲区
+                # 注意：chunk_file(full_path, ...) 用 full_path 读取源码，
+                # 但生成的 CodeChunk.file_path 也会被设为 full_path（绝对路径）。
+                # 检索结果与插件跳转都需要相对路径，故此处统一修正为 rel_path。
                 chunks = chunk_file(full_path, table)
+                for _c in chunks:
+                    _c.file_path = rel_path
                 batch_chunks.extend(chunks)
                 batch_file_paths.append(rel_path)
 
