@@ -66,6 +66,52 @@ def to_posix_relpath(path: str) -> str:
         return path
     return PurePosixPath(path.replace("\\", "/")).as_posix()
 
+
+def to_workspace_relative(file_path: str, workspace_root: str) -> Optional[str]:
+    """
+    将任意路径（绝对或相对）转换为相对于 workspace_root 的 POSIX 相对路径。
+
+    用于确保索引与检索结果中存储的路径始终是工作区相对路径，
+    避免绝对路径（如系统临时目录 %TEMP% 下的文件）被收入索引。
+
+    处理规则：
+      1. 若 file_path 是绝对路径：计算其相对于 workspace_root 的相对路径。
+         若该绝对路径不在 workspace_root 下（如 C:\\...\\Temp\\xxx），返回 None。
+      2. 若 file_path 是相对路径：先与 workspace_root 拼接解析为绝对路径，
+         再做 "是否在 workspace_root 下" 的校验（防止 ..\\..\\ 逃逸），
+         通过后转为 POSIX 相对路径。
+      3. 路径含 .. 导致逃逸出 workspace_root 时返回 None。
+
+    Args:
+        file_path:      任意格式的文件路径（绝对 / 相对，Windows / POSIX）
+        workspace_root: 工作区根目录绝对路径
+
+    Returns:
+        工作区相对路径（POSIX 正斜杠）；若路径不在工作区内则返回 None。
+    """
+    if not file_path or not workspace_root:
+        return None
+
+    # 统一反斜杠为正斜杠后再交给 pathlib 处理
+    p = Path(file_path.replace("\\", "/"))
+    root = Path(workspace_root.replace("\\", "/")).resolve()
+
+    # 转为绝对路径（相对路径基于 workspace_root 解析）
+    if p.is_absolute():
+        abs_path = p.resolve()
+    else:
+        abs_path = (root / p).resolve()
+
+    # 校验：abs_path 必须在 root 之下（防止 .. 逃逸）
+    try:
+        abs_path.relative_to(root)
+    except ValueError:
+        return None
+
+    rel = os.path.relpath(abs_path, root)
+    return to_posix_relpath(rel)
+
+
 # 索引时跳过的目录
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build", ".idea", ".vscode"}
 # 单文件大小上限（1MB）
@@ -709,10 +755,21 @@ class IndexService:
         root = workspace_root or self.workspace_root or os.getcwd()
         dep_graph = get_dependency_graph()
 
-        # S5 第 49-50 天：插件传入的 file_path 可能含 Windows 反斜杠，
-        # 统一归一化为 POSIX 正斜杠，与 _scan_files 的全量索引保持一致，
-        # 避免 delete_by_file / 符号表查找因分隔符不同而匹配失败。
-        file_path = to_posix_relpath(file_path)
+        # 增量更新入口的路径归一化（S5 修复：限制只索引 workspace_root 下的文件）
+        # 插件可能传入绝对路径（含系统临时目录 %TEMP% 下的文件）或含 .. 的相对路径，
+        # 统一转为工作区相对路径；若路径不在工作区内则拒绝索引，避免污染向量库。
+        rel_path = to_workspace_relative(file_path, root)
+        if rel_path is None:
+            logger.warning(
+                f"[IndexService] 增量更新跳过非工作区文件: "
+                f"file_path={file_path}, workspace_root={root}"
+            )
+            return {
+                "success": False,
+                "message": f"文件不在工作区内，已跳过: {file_path}",
+                "symbols_count": 0,
+            }
+        file_path = rel_path
 
         if action == "deleted":
             with self._lock:

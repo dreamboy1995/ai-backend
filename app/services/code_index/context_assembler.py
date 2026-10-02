@@ -21,6 +21,7 @@
 
 import html
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -372,6 +373,67 @@ class ContextAssembler:
         return count_tokens([{"role": "user", "content": content}])
 
     # ------------------------------------------------------------
+    # 路径归一化与存在性校验（S5 修复：references 路径统一为工作区相对路径）
+    # ------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_and_validate_path(
+        file_path: str, workspace_root: Optional[str]
+    ) -> Optional[str]:
+        """
+        将 chunk 的 file_path 归一化为工作区相对路径，并校验文件真实存在。
+
+        处理规则：
+          1. 若 workspace_root 未知（后端尚未索引过任何工作区），无法判断路径
+             是否在工作区内，此时不做过滤（保留原路径，由前端处理）。
+          2. 使用 index_service.to_workspace_relative 将绝对/相对路径统一转为
+             工作区相对路径；路径不在工作区内时返回 None。
+          3. 校验文件是否真实存在于 workspace_root 下，不存在则返回 None。
+
+        用于过滤掉向量库中残留的跨工作区脏数据（如系统临时目录文件、
+        其他工作区的相对路径），避免返回给前端的 references 指向不存在的文件。
+
+        Args:
+            file_path:      chunk 中的文件路径（可能是绝对路径或其他工作区的相对路径）
+            workspace_root: 当前工作区根路径
+
+        Returns:
+            工作区相对路径（POSIX 正斜杠）；若无效则返回 None。
+        """
+        if not file_path:
+            return None
+        if not workspace_root:
+            # 工作区未知时不做过滤，保留原路径（降级策略）
+            return file_path.replace("\\", "/")
+
+        # 延迟导入避免循环依赖
+        from .index_service import to_workspace_relative
+
+        rel = to_workspace_relative(file_path, workspace_root)
+        if rel is None:
+            return None
+
+        # 校验文件真实存在于工作区
+        full_path = os.path.join(workspace_root, rel)
+        if not os.path.isfile(full_path):
+            return None
+        return rel
+
+    @staticmethod
+    def _get_workspace_root() -> Optional[str]:
+        """
+        获取当前工作区根路径（从 IndexService 单例读取）。
+
+        IndexService 在首次索引时会缓存 workspace_root，
+        增量更新与检索时复用该值。若尚未索引过任何工作区则返回 None。
+        """
+        try:
+            from .index_service import get_index_service
+            return get_index_service().workspace_root
+        except Exception:
+            return None
+
+    # ------------------------------------------------------------
     # 主入口：assemble
     # ------------------------------------------------------------
 
@@ -385,6 +447,7 @@ class ContextAssembler:
         执行完整的上下文组装流程。
 
         流程：
+          0. 路径归一化 + 存在性校验：过滤掉不在工作区内或不存在的文件的 chunk
           1. 位置权重打分 + 排序（光标文件 +30%）
           2. 逐 Chunk 智能压缩
           3. 动态 Token 预算控制（低分优先丢弃）
@@ -407,6 +470,37 @@ class ContextAssembler:
         )
 
         if not chunks:
+            return AssemblyResult(stats=stats)
+
+        # 步骤 0：路径归一化 + 存在性校验
+        # 向量库为全局共享，可能残留其他工作区/系统临时目录的脏数据。
+        # 此处统一将 file_path 转为工作区相对路径，并过滤掉不存在的文件，
+        # 确保返回给前端的 references 均可正确跳转。
+        workspace_root = self._get_workspace_root()
+        valid_chunks: List[Dict[str, Any]] = []
+        skipped_invalid = 0
+        for ch in chunks:
+            fp = ch.get("file_path", "") or ""
+            norm_fp = self._normalize_and_validate_path(fp, workspace_root)
+            if norm_fp is None:
+                skipped_invalid += 1
+                logger.debug(
+                    f"[ContextAssembler] 跳过无效路径 Chunk: "
+                    f"file_path={fp}, symbol={ch.get('symbol_name')}"
+                )
+                continue
+            # 用归一化后的工作区相对路径替换原路径
+            ch = dict(ch)
+            ch["file_path"] = norm_fp
+            valid_chunks.append(ch)
+        if skipped_invalid:
+            logger.info(
+                f"[ContextAssembler] 路径校验过滤: 输入 {len(chunks)} 个 Chunk, "
+                f"跳过 {skipped_invalid} 个无效路径, 保留 {len(valid_chunks)} 个"
+            )
+        chunks = valid_chunks
+        if not chunks:
+            stats.kept_chunks = 0
             return AssemblyResult(stats=stats)
 
         budget = self.compute_budget(model_context_window)

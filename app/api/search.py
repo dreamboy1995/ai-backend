@@ -5,16 +5,44 @@
 # 通过 LanceDB 向量检索，返回与查询语义最相关的代码切片（函数/类/import 块）。
 
 import logging
+import os
 
 from fastapi import APIRouter, HTTPException, Query
 
 from app.config import settings
 from app.models.schemas import SearchResponse, SearchResultItem
 from app.services.code_index.embedding_client import get_embedding_client
+from app.services.code_index.index_service import get_index_service, to_workspace_relative
 from app.services.code_index.vector_store import get_vector_store
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+def _filter_workspace_results(results: list) -> list:
+    """
+    过滤向量检索结果：仅保留工作区内且真实存在的文件，统一转为工作区相对路径。
+
+    向量库为全局共享，可能残留其他工作区/系统临时目录的脏数据。
+    此处做与 context_assembler 相同的路径归一化与存在性校验，
+    确保 /v1/search 返回的 file_path 均可被前端正确跳转。
+    """
+    workspace_root = get_index_service().workspace_root
+    if not workspace_root:
+        return results
+
+    filtered = []
+    for r in results:
+        fp = r.get("file_path", "") or ""
+        rel = to_workspace_relative(fp, workspace_root)
+        if rel is None:
+            continue
+        if not os.path.isfile(os.path.join(workspace_root, rel)):
+            continue
+        r = dict(r)
+        r["file_path"] = rel
+        filtered.append(r)
+    return filtered
 
 
 @router.get("", response_model=SearchResponse)
@@ -47,6 +75,9 @@ async def search_code(
     except Exception as e:
         logger.error(f"[SearchAPI] 向量检索失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"向量检索失败: {e}")
+
+    # S5 修复：过滤非工作区/不存在的文件，统一转为工作区相对路径
+    results = _filter_workspace_results(results)
 
     items = [SearchResultItem(**r) for r in results]
     return SearchResponse(
