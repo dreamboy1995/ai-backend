@@ -353,3 +353,43 @@ class ChatMetaChunk(BaseModel):
     """
     type: Literal["meta"] = "meta"
     references: List[ReferenceItem] = []
+
+
+# ============================================================
+# S6 第 53-54 天：多文件修改 Diff 元数据块（SSE type:diff）
+# ============================================================
+
+class DiffFileItem(BaseModel):
+    """
+    SSE 流 diff 块中的单文件变更（S6 关键接口变更）。
+
+    插件 DiffPreviewPanel 依据此结构渲染"逐文件 Diff 预览"：
+    - path:          文件相对路径（相对于工作区根目录）
+    - old_content:   原文件完整内容（新增文件为空串）
+    - new_content:   模型返回的新文件完整内容
+    - diff:          Unified Diff 文本（供原生差异对比器使用）
+    """
+    path: str
+    old_content: str = ""
+    new_content: str = ""
+    diff: str = ""
+
+
+class ChatDiffChunk(BaseModel):
+    """
+    SSE 流的 Diff 元数据块（S6 关键接口变更）。
+
+    在流结束前（[DONE] 之前）推送，承载多文件修改的 Diff 数据，
+    供插件在侧边栏打开 DiffPreviewPanel 进行逐行接受/拒绝。
+
+    SSE 推送格式：
+        data: {"type":"diff","files":[
+            {"path":"src/main.py","old_content":"...","new_content":"...","diff":"..."}
+        ]}
+
+    S6 风险预警应对（Diff 数据量过大）：
+    - 当 files 数量超过 3 个时，后端会拆分为多个 type:diff 块分片推送，
+      每个块只包含部分文件，避免单个 SSE 包过大。插件需聚合所有 diff 块。
+    """
+    type: Literal["diff"] = "diff"
+    files: List[DiffFileItem] = []

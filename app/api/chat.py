@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from typing import Dict, List, Optional
 from app.models.schemas import (
-    ChatRequest, ChatChunk, ChatMetaChunk, ContextItem, ReferenceItem,
+    ChatRequest, ChatChunk, ChatMetaChunk, ChatDiffChunk, ContextItem, ReferenceItem,
 )
 from app.services.llm import (
     AdapterFactory,
@@ -20,6 +20,7 @@ from app.services.session import get_session_service, count_tokens
 from app.services.context_builder import ContextBuilder
 from app.services.code_index.context_assembler import get_context_assembler
 from app.services.quota import get_quota_service
+from app.services.diff_generator import build_diff_files, get_workspace_root
 from app.middlewares.request_id import get_request_id, REQUEST_ID_HEADER
 from app.auth import get_current_user
 from app.config import settings
@@ -56,6 +57,66 @@ _INLINE_SYSTEM_INSTRUCTION = (
     "\n\n[Inline Chat 模式] 你正在修改用户选中的代码片段。"
     "请直接输出修改后的完整新代码，不要加任何解释。"
 )
+
+# S6 第 53-54 天：多文件 JSON Mode 的强化 System Prompt
+# 当 response_format=json_object 时，强制模型返回结构化 JSON，
+# 包含 files 数组（path + 完整新内容），供后端生成 Diff。
+# 验收标准：用户要求修改多个文件时，后端返回的 JSON 含 files 数组且每个元素有 path/content。
+_JSON_MODE_SYSTEM_INSTRUCTION = (
+    "\n\n[结构化输出模式] 如果用户要求修改代码，你**必须**返回合法的 JSON，"
+    "不要输出任何解释、问候语或 markdown 代码围栏标记，格式如下：\n"
+    "{\n"
+    '  "files": [\n'
+    '    {"path": "src/main.py", "content": "修改后的完整文件内容"},\n'
+    '    {"path": "src/utils.py", "content": "修改后的完整文件内容"}\n'
+    "  ],\n"
+    '  "explanation": "简短描述你做了哪些修改（可选，仅当用户询问时）"\n'
+    "}\n"
+    "注意：\n"
+    "1. path 必须使用相对于工作区根目录的路径（如 src/main.py，不要用绝对路径）。\n"
+    "2. content 必须是该文件的**完整新内容**，而不是 Diff 补丁或片段。\n"
+    "3. 如果只改一个文件，files 数组里就只有一个元素。\n"
+    "4. 不要在 JSON 前后添加 ```json 或 ``` 标记。"
+)
+
+
+def _parse_json_files(content: str) -> Optional[List[dict]]:
+    """
+    从模型返回的文本中提取 JSON 并校验 files 结构。
+
+    S6 风险预警应对：模型即使加了 response_format，有时仍会在 JSON 前后加
+    ```json 标记或解释文字。本函数用正则提取纯净 JSON 体并包裹 try-except。
+
+    Args:
+        content: 模型返回的完整文本。
+
+    Returns:
+        files 数组（List[dict]）；解析失败或结构不符时返回 None。
+    """
+    if not content:
+        return None
+
+    import re
+    # 提取第一个 { 到最后一个 } 之间的内容（dotall 匹配换行）
+    match = re.search(r"\{.*\}", content, re.DOTALL)
+    if not match:
+        return None
+
+    json_text = match.group(0)
+    try:
+        import json as _json
+        data = _json.loads(json_text)
+    except Exception:
+        return None
+
+    if not isinstance(data, dict):
+        return None
+
+    files = data.get("files")
+    if not isinstance(files, list) or not files:
+        return None
+
+    return files
 
 
 def _extract_last_user_query(messages: List) -> str:
@@ -339,6 +400,14 @@ async def chat_completions(
             f"file={request.inline_selection.file_path if request.inline_selection else 'N/A'}"
         )
 
+    # S6 第 53-54 天：JSON Mode —— 当 response_format=json_object 时，
+    # 在 System Prompt 末尾追加结构化输出指令，强制模型返回含 files 数组的 JSON。
+    if request.response_format is not None:
+        final_system_prompt = final_system_prompt + _JSON_MODE_SYSTEM_INSTRUCTION
+        logger.info(
+            "[Chat] JSON Mode 已启用，已追加结构化输出 System Prompt 指令"
+        )
+
     # 组装最终消息列表：[system] + 非 system 历史
     llm_messages = [{"role": "system", "content": final_system_prompt}] + non_system_messages
 
@@ -371,8 +440,9 @@ async def chat_completions(
             request_timeout = settings.CHAT_TIMEOUT_SECONDS
             default_max_tokens = settings.CHAT_MAX_TOKENS
 
-        adapter_params = {
-            "messages": llm_messages,
+        # S6 第 53-54 天：将 messages 从 adapter_params 中分离，
+        # 便于 JSON Mode 解析失败重试时传入追加了强化指令的消息列表。
+        base_adapter_params = {
             "model": model_id,
             "temperature": request.temperature if request.temperature is not None else 0.7,
             "stream": request.stream if request.stream is not None else True,
@@ -381,24 +451,22 @@ async def chat_completions(
         }
 
         # S6 新增：透传 response_format 给厂商 API（DeepSeek/OpenAI 支持 json_object）。
-        # 字段随接口提前开放，具体 JSON 解析与重试逻辑在第 53-54 天实现。
         if request.response_format is not None:
-            adapter_params["response_format"] = request.response_format.model_dump()
+            base_adapter_params["response_format"] = request.response_format.model_dump()
             logger.info(
                 f"[Chat] 已启用结构化输出 response_format={request.response_format.type}"
             )
 
         logger.info(
             f"[Chat] 使用模型: model={model_id}, mode={request.mode}, "
-            f"temperature={adapter_params['temperature']}, "
-            f"max_tokens={adapter_params['max_tokens']}, "
+            f"temperature={base_adapter_params['temperature']}, "
+            f"max_tokens={base_adapter_params['max_tokens']}, "
             f"timeout={request_timeout}s"
         )
 
         # 如果是流式请求，返回StreamingResponse
         if request.stream:
             async def generate_stream():
-                assistant_content_parts: List[str] = []
                 # S5 第 43-44 天：在第一个 content chunk 之前推送 references meta 块
                 # 前端状态机：先收到 type:meta 时存储引用列表，流结束时统一渲染
                 # （S5 风险预警应对：避免 Webview 未渲染完毕时引用信息丢失）
@@ -408,32 +476,112 @@ async def chat_completions(
                         yield f"data: {meta_chunk.model_dump_json()}\n\n"
                     except Exception as e:
                         logger.warning(f"[Chat] references meta 块推送失败（不影响对话）: {e}")
-                try:
-                    async for chunk in adapter.chat_completion(**adapter_params):
-                        # 收集助手回复内容，用于后续写入会话历史
+
+                # S6 第 53-54 天：JSON Mode 相关准备
+                is_json_mode = request.response_format is not None
+                # 仅在 JSON Mode 下获取工作区根目录，用于读取原文件生成 Diff
+                workspace_root = get_workspace_root() if is_json_mode else None
+
+                # 单次模型调用的结果容器。
+                # async generator 无法通过 return 把值直接交给 async for 调用方，
+                # 故用可变 dict 承载本次调用收集到的完整文本。
+                result_holder: Dict[str, str] = {"content": ""}
+
+                async def stream_one_call(messages_for_call: List[dict]):
+                    """
+                    执行一次模型流式调用：
+                    - 将 content delta 实时转发给客户端（保持流式体验）；
+                    - 同时把完整文本收集到 result_holder["content"]，供后续 JSON 解析。
+                    """
+                    parts: List[str] = []
+                    call_params = dict(base_adapter_params)
+                    call_params["messages"] = messages_for_call
+                    async for chunk in adapter.chat_completion(**call_params):
                         choices = chunk.get("choices", [])
                         if choices:
                             delta = choices[0].get("delta", {})
                             content = delta.get("content")
                             if content:
-                                assistant_content_parts.append(content)
+                                parts.append(content)
 
-                        # 转换为ChatChunk格式
+                        # 转换为 ChatChunk 格式转发
                         chat_chunk = ChatChunk(
                             id=chunk.get("id", ""),
                             object=chunk.get("object", ""),
                             created=chunk.get("created", 0),
                             model=chunk.get("model", ""),
                             choices=chunk.get("choices", []),
-                            usage=chunk.get("usage")
+                            usage=chunk.get("usage"),
                         )
                         yield f"data: {chat_chunk.model_dump_json()}\n\n"
+                    result_holder["content"] = "".join(parts)
+
+                try:
+                    # 第一次调用
+                    async for sse in stream_one_call(llm_messages):
+                        yield sse
+                    full_content = result_holder["content"]
+
+                    # S6 第 53-54 天：JSON Mode 解析与自动重试
+                    # 风险预警应对：模型偶尔会在 JSON 前后加 ```json 标记或拒绝返回 JSON。
+                    # 首次解析失败时自动重试一次，重试时在 User Message 中强硬强调
+                    # "只返回 JSON，不要解释"；重试仍失败则降级为纯文本输出。
+                    parsed_files = None
+                    if is_json_mode:
+                        parsed_files = _parse_json_files(full_content)
+                        if parsed_files is None:
+                            logger.info(
+                                "[Chat] JSON Mode 首次解析失败，自动重试一次"
+                                "（追加强化指令：只返回 JSON）"
+                            )
+                            retry_messages = list(llm_messages) + [
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        "只返回合法的 JSON 对象，不要任何解释、问候语"
+                                        "或 markdown 代码围栏标记。JSON 必须包含 files"
+                                        "数组，每个元素含 path（相对路径）和 content"
+                                        "（文件完整新内容）字段。"
+                                    ),
+                                }
+                            ]
+                            result_holder["content"] = ""
+                            async for sse in stream_one_call(retry_messages):
+                                yield sse
+                            full_content = result_holder["content"]
+                            parsed_files = _parse_json_files(full_content)
+                            if parsed_files is None:
+                                logger.warning(
+                                    "[Chat] JSON Mode 重试后仍解析失败，"
+                                    "降级为纯文本输出（不推送 Diff）"
+                                )
+
+                    # S6 第 53-54 天：解析成功则生成多文件 Unified Diff，
+                    # 在 [DONE] 之前推送 type:diff 块给前端 DiffPreviewPanel。
+                    if parsed_files is not None:
+                        diff_files = build_diff_files(parsed_files, workspace_root)
+                        if diff_files:
+                            # 风险预警应对：超过 3 个文件时分片推送，
+                            # 每个 SSE 包最多 3 个文件，避免单个包过大。
+                            chunk_size = 3
+                            total_batches = (
+                                len(diff_files) + chunk_size - 1
+                            ) // chunk_size
+                            for i in range(0, len(diff_files), chunk_size):
+                                batch = diff_files[i:i + chunk_size]
+                                diff_chunk = ChatDiffChunk(files=batch)
+                                yield f"data: {diff_chunk.model_dump_json()}\n\n"
+                            logger.info(
+                                f"[Chat] 已推送 {len(diff_files)} 个文件的 Diff 数据"
+                                f"（分 {total_batches} 块）"
+                            )
+
                     # 流正常结束，发送 [DONE] 标记（OpenAI 标准）
                     yield "data: [DONE]\n\n"
 
                     # 流正常结束后，将助手完整回复写入会话历史
-                    if session_id and assistant_content_parts:
-                        full_content = "".join(assistant_content_parts)
+                    # （JSON Mode 重试场景下，full_content 为最终一次调用的内容）
+                    if session_id and full_content:
                         session_service.append(
                             session_id,
                             {"role": "assistant", "content": full_content}
@@ -447,9 +595,10 @@ async def chat_completions(
                     # 流式响应通常不返回 usage，使用 tiktoken 估算
                     # 输入 Token = 发送给模型的消息列表
                     input_tokens = count_tokens(llm_messages)
-                    # 输出 Token = 助手回复内容
-                    output_content = "".join(assistant_content_parts) if assistant_content_parts else ""
-                    output_tokens = count_tokens([{"role": "assistant", "content": output_content}])
+                    # 输出 Token = 助手最终回复内容
+                    output_tokens = count_tokens(
+                        [{"role": "assistant", "content": full_content}]
+                    )
                     total_tokens = input_tokens + output_tokens
                     if total_tokens > 0:
                         get_quota_service().record_usage(api_key, total_tokens)
