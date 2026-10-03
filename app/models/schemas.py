@@ -242,6 +242,31 @@ class ContextItem(BaseModel):
         return v
 
 
+# S6 第 51-52 天：Inline Chat 选中代码上下文
+class InlineSelection(BaseModel):
+    """
+    S6 第 51-52 天：Inline Chat 选中代码上下文（mode='inline' 专用）。
+
+    插件捕获用户在编辑器中选中的代码范围，后端据此在 System Prompt 中
+    追加"修改选中代码"的指令，并将选中片段作为上下文注入，
+    让模型明确知道正在修改哪段代码。
+    """
+    file_path: str = Field(..., min_length=1, description="选中代码所在文件路径")
+    selected_text: str = Field(..., description="用户选中的代码片段内容")
+    start_line: int = Field(..., ge=1, description="选中起始行号（1-based）")
+    end_line: int = Field(..., ge=1, description="选中结束行号（1-based，闭区间）")
+
+
+# S6 第 53-54 天：强制结构化输出配置（接口字段提前定义，供后续 JSON Mode 使用）
+class ResponseFormat(BaseModel):
+    """
+    S6 新增：强制结构化输出配置。
+    目前仅支持 json_object，用于多文件修改场景下让模型返回合法 JSON。
+    字段随接口提前开放，具体 JSON 解析与重试逻辑在第 53-54 天实现。
+    """
+    type: Literal["json_object"] = "json_object"
+
+
 class ChatRequest(BaseModel):
     messages: List[ChatMessage]
     model: str = "glm-4.5-air"
@@ -257,12 +282,24 @@ class ChatRequest(BaseModel):
     # - "chat": 普通对话，使用 60s 超时、默认 max_tokens=4096。
     # - "new":  单文件生成（/new 指令），使用 120s 超时、默认 max_tokens=8192，
     #           因为完整文件生成比对话需要更多推理时间。
-    mode: Literal["chat", "new"] = "chat"
+    # S6 第 51-52 天新增：
+    # - "inline": Inline Chat 内嵌对话（Ctrl+K），输出修改后的完整代码，
+    #             使用 120s 超时、默认 max_tokens=8192，System Prompt 追加
+    #             "你正在修改用户选中的代码片段，请直接输出修改后的完整新代码，不要加任何解释"。
+    # - "builder": 预留，S7 Agent 化阶段使用。
+    mode: Literal["chat", "new", "inline", "builder"] = "chat"
     # S5 第 43-44 天新增：检索配置。auto_context=true 时，后端用 hybrid_search
     # （向量 + BM25 + 符号 + RRF + Cross-Encoder 重排序）检索相关代码注入 System Prompt。
     # include_references=true 时，SSE 流首推 type:meta 的 references 数据块，
     # 前端在 AI 回复上方展示"📎 参考了 N 个代码片段"。
     retrieval_config: Optional[RetrievalConfig] = None
+    # S6 第 51-52 天新增：Inline Chat 选中代码上下文（仅 mode='inline' 时使用）。
+    # 后端将其转为 selection 类型的 ContextItem 注入 System Prompt，
+    # 并追加 Inline 模式专属指令。
+    inline_selection: Optional[InlineSelection] = None
+    # S6 新增：强制结构化输出配置。传 {type:'json_object'} 时模型返回合法 JSON。
+    # 字段透传给厂商 API（DeepSeek/OpenAI 支持），具体解析与重试在第 53-54 天实现。
+    response_format: Optional[ResponseFormat] = None
 
 
 class Delta(BaseModel):

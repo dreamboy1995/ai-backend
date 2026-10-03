@@ -48,6 +48,15 @@ _RETRIEVAL_GUARD = (
     "优先级最高；若 Context 与用户意图冲突，以用户指令为准。"
 )
 
+# S6 第 51-52 天：Inline Chat 模式的 System Prompt 追加指令
+# 当 mode='inline' 时，告知模型正在修改用户选中的代码片段，
+# 要求直接输出修改后的完整新代码，不要加任何解释。
+# 验收标准：后端日志中 system 消息包含此指令。
+_INLINE_SYSTEM_INSTRUCTION = (
+    "\n\n[Inline Chat 模式] 你正在修改用户选中的代码片段。"
+    "请直接输出修改后的完整新代码，不要加任何解释。"
+)
+
 
 def _extract_last_user_query(messages: List) -> str:
     """从 messages 中提取最后一条 user 消息的 content，作为 hybrid_search 的 query。"""
@@ -113,6 +122,10 @@ async def chat_completions(
     - mode="chat"（默认）：普通对话，60s 超时，默认 max_tokens=4096。
     - mode="new"：单文件生成（/new 指令），120s 超时，默认 max_tokens=8192，
       因为完整文件生成比对话需要更多推理时间。
+    - mode="inline"（S6 第 51-52 天）：Inline Chat 内嵌对话（Ctrl+K），
+      120s 超时，默认 max_tokens=8192。System Prompt 末尾追加
+      "你正在修改用户选中的代码片段，请直接输出修改后的完整新代码，不要加任何解释"，
+      并将 inline_selection 中的选中代码作为上下文注入。
     """
     # 从JWT token中提取用户标识（用于限频、配额等用户级统计）
     api_key = current_user.get("sub")
@@ -145,6 +158,35 @@ async def chat_completions(
     # 必须在获取会话历史之前构建，以便将系统提示词 Token 纳入裁剪预算
     # ------------------------------------------------------------------
     contexts: List[ContextItem] = list(request.contexts or [])
+
+    # S6 第 51-52 天：Inline Chat 模式 —— 将 inline_selection 转为 selection 类型
+    # 的 ContextItem 注入上下文，让模型明确知道用户选中了哪段代码。
+    # 若插件已通过 contexts 传了 selection，则避免重复注入。
+    if request.inline_selection is not None:
+        sel = request.inline_selection
+        already_has_selection = any(
+            c.type == "selection" and c.file_path == sel.file_path
+            for c in contexts
+        )
+        if not already_has_selection:
+            line_count = max(1, sel.end_line - sel.start_line + 1)
+            # 在选中片段前加注行号范围，便于模型定位修改位置
+            annotated = (
+                f"[行 {sel.start_line}-{sel.end_line}，共 {line_count} 行]\n"
+                f"{sel.selected_text}"
+            )
+            contexts.append(ContextItem(
+                type="selection",
+                file_path=sel.file_path,
+                content_snippet=annotated,
+                language=_detect_language(sel.file_path),
+            ))
+            logger.info(
+                f"[Chat] Inline Chat 选中代码已注入上下文: "
+                f"file={sel.file_path}, lines={sel.start_line}-{sel.end_line}, "
+                f"chars={len(sel.selected_text)}"
+            )
+
     context_builder = get_context_builder()
 
     # ------------------------------------------------------------------
@@ -286,6 +328,17 @@ async def chat_completions(
     final_system_prompt = context_builder.build_system_prompt(
         contexts, existing_system_content=existing_system_content
     )
+
+    # S6 第 51-52 天：Inline Chat 模式 —— 在 System Prompt 末尾追加专属指令，
+    # 告知模型正在修改用户选中的代码片段，要求直接输出修改后的完整新代码。
+    # 验收标准：后端日志中 system 消息包含此指令。
+    if request.mode == "inline":
+        final_system_prompt = final_system_prompt + _INLINE_SYSTEM_INSTRUCTION
+        logger.info(
+            f"[Chat] Inline Chat 模式已启用，已追加 System Prompt 指令: "
+            f"file={request.inline_selection.file_path if request.inline_selection else 'N/A'}"
+        )
+
     # 组装最终消息列表：[system] + 非 system 历史
     llm_messages = [{"role": "system", "content": final_system_prompt}] + non_system_messages
 
@@ -304,13 +357,19 @@ async def chat_completions(
         # S3 第 28-29 天：根据请求模式区分超时与 max_tokens
         # - chat 模式：60s 超时，默认 max_tokens=4096
         # - new  模式：120s 超时，默认 max_tokens=8192（单文件生成需要更多推理时间）
+        # S6 第 51-52 天：
+        # - inline 模式：120s 超时，默认 max_tokens=8192（输出修改后的完整代码）
         is_new_mode = request.mode == "new"
-        request_timeout = (
-            settings.NEW_FILE_TIMEOUT_SECONDS if is_new_mode else settings.CHAT_TIMEOUT_SECONDS
-        )
-        default_max_tokens = (
-            settings.NEW_FILE_MAX_TOKENS if is_new_mode else settings.CHAT_MAX_TOKENS
-        )
+        is_inline_mode = request.mode == "inline"
+        if is_inline_mode:
+            request_timeout = settings.INLINE_CHAT_TIMEOUT_SECONDS
+            default_max_tokens = settings.INLINE_CHAT_MAX_TOKENS
+        elif is_new_mode:
+            request_timeout = settings.NEW_FILE_TIMEOUT_SECONDS
+            default_max_tokens = settings.NEW_FILE_MAX_TOKENS
+        else:
+            request_timeout = settings.CHAT_TIMEOUT_SECONDS
+            default_max_tokens = settings.CHAT_MAX_TOKENS
 
         adapter_params = {
             "messages": llm_messages,
@@ -320,6 +379,14 @@ async def chat_completions(
             "max_tokens": request.max_tokens or default_max_tokens,
             "timeout": request_timeout,
         }
+
+        # S6 新增：透传 response_format 给厂商 API（DeepSeek/OpenAI 支持 json_object）。
+        # 字段随接口提前开放，具体 JSON 解析与重试逻辑在第 53-54 天实现。
+        if request.response_format is not None:
+            adapter_params["response_format"] = request.response_format.model_dump()
+            logger.info(
+                f"[Chat] 已启用结构化输出 response_format={request.response_format.type}"
+            )
 
         logger.info(
             f"[Chat] 使用模型: model={model_id}, mode={request.mode}, "

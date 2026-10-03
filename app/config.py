@@ -54,6 +54,12 @@ class Settings(BaseSettings):
     CHAT_MAX_TOKENS: int = 4096              # 普通对话默认 max_tokens
     NEW_FILE_MAX_TOKENS: int = 8192          # /new 单文件生成默认 max_tokens
 
+    # S6 第 51-52 天：Inline Chat 模式超时与 max_tokens 配置
+    # Inline 模式下 AI 需要输出修改后的完整代码，类似 /new 单文件生成，
+    # 故使用较长超时和较大 max_tokens，确保完整代码能输出完毕。
+    INLINE_CHAT_TIMEOUT_SECONDS: float = 120.0  # Inline Chat 超时（秒）
+    INLINE_CHAT_MAX_TOKENS: int = 8192          # Inline Chat 默认 max_tokens
+
     # S4 第 33-34 天：代码向量化配置
     # embedding_mode:
     #   - "local"  : 使用本地 sentence-transformers 模型（all-MiniLM-L6-v2，384 维）
