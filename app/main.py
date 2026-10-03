@@ -1,6 +1,7 @@
 import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.exceptions import RequestValidationError
 from fastapi import HTTPException
 import uvicorn
@@ -57,6 +58,12 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # S6 第 55-56 天：Gzip 压缩中间件（风险预警应对）
+    # 多文件修改场景下 Diff 数据可能达到数 MB，开启 Gzip 可显著压缩 SSE 包体积。
+    # minimum_size=1024 表示仅压缩超过 1KB 的响应，避免小响应的压缩开销。
+    # GZipMiddleware 对 StreamingResponse（SSE）同样生效，会逐块压缩流内容。
+    app.add_middleware(GZipMiddleware, minimum_size=1024)
 
     # 中间件注册顺序说明：
     # app.middleware("http") 先注册者为最内层（后执行），后注册者为最外层（先执行）。

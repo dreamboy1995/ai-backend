@@ -26,9 +26,52 @@ logger = logging.getLogger(__name__)
 # S6 第 55-56 天：超大文件只生成变更行附近的 Diff 上下文（上下文行数 = 3）
 DEFAULT_DIFF_CONTEXT_LINES = 3
 
+# S6 第 55-56 天：大文件阈值（行数）。超过该阈值的文件视为"超大文件"，
+# 只保留变更行附近 3 行上下文，避免 Diff 数据过大撑爆 SSE 包。
+LARGE_FILE_LINE_THRESHOLD = 500
+# 超大文件的 Diff 上下文行数（变更行前后各保留 N 行）
+LARGE_FILE_CONTEXT_LINES = 3
+# 小文件（<= 500 行）的 Diff 上下文行数。
+# 设为远大于阈值的值，使小文件的 Diff 保留完整上下文（等价于展示全文件变更），
+# 让用户在小文件场景下获得最完整的代码审查视野。
+SMALL_FILE_CONTEXT_LINES = 1000
+
 # 单文件 Diff 字符数上限（防止极端大文件撑爆单个 SSE 包）。
 # 超过时截断 diff 文本并标记 [diff truncated]，前端仍可凭 old/new_content 自行渲染。
 MAX_DIFF_CHARS_PER_FILE = 200_000
+
+
+def _count_lines(content: str) -> int:
+    """
+    统计文本行数。
+    按换行符分割计数；若末尾无换行符则最后一行也算一行。
+    """
+    if not content:
+        return 0
+    # splitlines() 不包含末尾空行，更符合"逻辑行数"的直觉
+    return len(content.splitlines())
+
+
+def determine_context_lines(content: str) -> int:
+    """
+    根据文件内容行数动态决定 Diff 上下文行数（S6 第 55-56 天优化）。
+
+    策略：
+    - 行数 > LARGE_FILE_LINE_THRESHOLD（500）的超大文件：只保留变更行附近
+      LARGE_FILE_CONTEXT_LINES（3）行上下文，控制 Diff 体积。
+    - 行数 <= 阈值的小文件：使用 SMALL_FILE_CONTEXT_LINES（1000）行上下文，
+      等价于展示完整文件变更，给用户最完整的审查视野。
+
+    Args:
+        content: 文件内容（old_content 或 new_content，取较大者判断更稳妥）。
+
+    Returns:
+        该文件应使用的 Diff 上下文行数。
+    """
+    line_count = _count_lines(content)
+    if line_count > LARGE_FILE_LINE_THRESHOLD:
+        return LARGE_FILE_CONTEXT_LINES
+    return SMALL_FILE_CONTEXT_LINES
 
 
 def _is_path_within(root: str, target: str) -> bool:
@@ -137,15 +180,20 @@ def generate_unified_diff(
 def build_diff_files(
     files_json: List[Dict],
     workspace_root: Optional[str],
-    context_lines: int = DEFAULT_DIFF_CONTEXT_LINES,
+    context_lines: Optional[int] = None,
 ) -> List[Dict]:
     """
     将模型返回的 files JSON 数组转换为含 old_content / new_content / diff 的结构。
 
+    S6 第 55-56 天优化：默认根据每个文件的行数动态选择上下文行数。
+    - 超大文件（>500 行）：只保留变更行附近 3 行上下文，控制 Diff 体积。
+    - 小文件（<=500 行）：保留完整上下文，给用户最完整的审查视野。
+
     Args:
         files_json: 模型返回的 files 数组，每个元素含 path 和 content。
         workspace_root: 工作区根目录，用于读取原文件。
-        context_lines: Diff 上下文行数。
+        context_lines: Diff 上下文行数。为 None 时按文件大小动态选择；
+                       显式传入时所有文件统一使用该值。
 
     Returns:
         列表，每个元素为：
@@ -170,8 +218,18 @@ def build_diff_files(
             continue
 
         old_content = read_original_content(path, workspace_root)
+
+        # S6 第 55-56 天：动态上下文行数。
+        # 取 old/new 中较大的行数判断，避免新增文件（old 为空）误判为小文件。
+        if context_lines is not None:
+            effective_context = context_lines
+        else:
+            effective_context = determine_context_lines(
+                old_content if len(old_content) >= len(new_content) else new_content
+            )
+
         diff_text = generate_unified_diff(
-            old_content, new_content, path, context_lines=context_lines
+            old_content, new_content, path, context_lines=effective_context
         )
 
         result.append({
@@ -182,7 +240,9 @@ def build_diff_files(
         })
         logger.info(
             f"[DiffGenerator] 生成 Diff: file={path}, "
-            f"old_chars={len(old_content)}, new_chars={len(new_content)}, "
+            f"old_lines={_count_lines(old_content)}, "
+            f"new_lines={_count_lines(new_content)}, "
+            f"context_lines={effective_context}, "
             f"diff_chars={len(diff_text)}"
         )
 
