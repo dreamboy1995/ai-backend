@@ -311,6 +311,30 @@ class AgentStateMachine:
             )
             return step
 
+    def fail_remaining_steps(self, reason: str = "会话结束，步骤未执行") -> List[TaskStep]:
+        """
+        将所有 pending / running 步骤标记为 failed。
+
+        用于会话终态退出（completed 存在失败步骤 / max_iter / timeout / error）时，
+        清理无法再执行的剩余步骤，避免前端看到"卡住的 pending"。
+
+        注意：done / failed / blocked 步骤保持原样，不重复处理。
+        """
+        with self._lock:
+            failed: List[TaskStep] = []
+            for step in self._session.plan:
+                if step.status in ("pending", "running"):
+                    step.status = "failed"
+                    step.observation = f"[ERROR] {reason}"
+                    failed.append(step)
+            if failed:
+                self._session.updated_at = time.time()
+                logger.info(
+                    f"[StateMachine] 会话结束，标记 {len(failed)} 个未完成步骤为 failed: "
+                    f"{[s.id for s in failed]}"
+                )
+            return failed
+
     # ------------------------------------------------------------------
     # 整体进度
     # ------------------------------------------------------------------

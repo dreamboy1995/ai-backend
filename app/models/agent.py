@@ -28,6 +28,29 @@ from pydantic import BaseModel, Field
 StepStatus = Literal["pending", "running", "done", "failed", "blocked"]
 SUGGESTED_TOOLS = Literal["write_file", "run_command", "search_code", "ask_user"]
 
+# ============================================================
+# 会话结束原因常量
+# ============================================================
+# idle: 刚创建，尚未开始执行
+# paused: 用户主动暂停（可恢复）
+# ask_user: 等待用户回答问题（可恢复）
+# completed: 所有步骤正常完成
+# max_iter: 达到最大迭代次数（终态，不可恢复）
+# timeout: 执行超时（终态，不可恢复）
+# error: 执行异常（终态，不可恢复）
+END_REASON_IDLE = "idle"
+END_REASON_PAUSED = "paused"
+END_REASON_ASK_USER = "ask_user"
+END_REASON_COMPLETED = "completed"
+END_REASON_MAX_ITER = "max_iter"
+END_REASON_TIMEOUT = "timeout"
+END_REASON_ERROR = "error"
+
+# 终态原因：会话已死亡，不允许再次 start/resume/pause
+TERMINAL_END_REASONS = {END_REASON_COMPLETED, END_REASON_MAX_ITER, END_REASON_TIMEOUT, END_REASON_ERROR}
+# 可恢复原因：暂停/等待用户，允许 resume
+RESUMABLE_END_REASONS = {END_REASON_PAUSED, END_REASON_ASK_USER}
+
 
 class TaskStep(BaseModel):
     """
@@ -87,6 +110,10 @@ class AgentSession(BaseModel):
     is_executing: bool = Field(default=False, description="Agent 循环是否正在执行")
     interrupt_flag: bool = Field(default=False, description="中断标志，循环顶部检查")
     pending_question: Optional[str] = Field(default=None, description="待用户回答的问题（ask_user 工具）")
+    # 会话结束原因与描述（持久化到 Redis，供前端判断会话是否已死亡）
+    # 取值见 END_REASON_* 常量；None 表示运行中或未开始
+    end_reason: Optional[str] = Field(default=None, description="会话结束原因")
+    end_message: Optional[str] = Field(default=None, description="会话结束的详细描述")
     # 时间戳
     created_at: float = Field(default_factory=time.time, description="创建时间戳")
     updated_at: float = Field(default_factory=time.time, description="最后更新时间戳")
@@ -170,6 +197,8 @@ class AgentStatusResponse(BaseModel):
     pending_question: Optional[str]
     total_steps: int
     done_steps: int
+    end_reason: Optional[str] = Field(default=None, description="会话结束原因，None 表示运行中或未开始")
+    end_message: Optional[str] = Field(default=None, description="会话结束的详细描述")
 
 
 class AskUserRespondRequest(BaseModel):

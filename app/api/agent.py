@@ -26,9 +26,11 @@ from app.models.agent import (
     AgentStatusResponse,
     AskUserRespondRequest,
     AskUserRespondResponse,
+    END_REASON_IDLE,
     PlanPreviewItem,
     PlanRequest,
     PlanResponse,
+    TERMINAL_END_REASONS,
 )
 from app.services.agent_session_store import get_agent_session_store
 from app.services.agent_state_machine import (
@@ -56,6 +58,23 @@ def _get_session_or_404(session_id: str) -> AgentSession:
             detail=f"Agent 会话不存在: {session_id}",
         )
     return session
+
+
+def _ensure_session_alive(session: AgentSession) -> None:
+    """
+    检查会话是否已进入终态（已死亡），若是则返回 409 Conflict。
+
+    终态原因：completed / max_iter / timeout / error。
+    这些状态下不允许 start / resume / pause，防止前端误点击触发异常。
+    """
+    if session.end_reason in TERMINAL_END_REASONS:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"会话已结束（{session.end_reason}），无法执行该操作。"
+                f"结束原因：{session.end_message or '未知'}"
+            ),
+        )
 
 
 @router.post("/plan", response_model=PlanResponse)
@@ -88,6 +107,7 @@ async def create_plan(req: PlanRequest):
         workspace_root=req.workspace_root,
         model=req.model,
         plan=plan_steps,
+        end_reason=END_REASON_IDLE,
     )
 
     # 校验任务图合法性（依赖 ID 存在性 + 循环依赖检测）
@@ -136,6 +156,8 @@ async def get_status(session_id: str):
         pending_question=session.pending_question,
         total_steps=session.total_steps,
         done_steps=session.done_steps,
+        end_reason=session.end_reason,
+        end_message=session.end_message,
     )
 
 
@@ -149,15 +171,19 @@ async def start_agent(session_id: str):
     Builder 面板通过 /status 轮询观察步骤状态流转。
     """
     session = _get_session_or_404(session_id)
+    # 会话已死亡（终态）时拒绝启动，防止前端误点击触发异常
+    _ensure_session_alive(session)
 
     if is_agent_running(session_id):
         return AgentActionResponse(success=True, message="Agent 已在执行中")
 
-    # 清除可能残留的中断/暂停标志
+    # 清除可能残留的中断/暂停标志及结束标记
     session.is_executing = True
     session.is_paused = False
     session.interrupt_flag = False
     session.pending_question = None
+    session.end_reason = None
+    session.end_message = None
     get_agent_session_store().save(session)
 
     started = await start_agent_loop(session_id)
@@ -179,6 +205,8 @@ async def pause_agent(session_id: str):
     其 finally 块也会将 is_executing 置为 False（幂等）。
     """
     session = _get_session_or_404(session_id)
+    # 会话已死亡（终态）时拒绝暂停，防止前端误点击触发异常
+    _ensure_session_alive(session)
     session.is_paused = True
     session.interrupt_flag = True
     session.is_executing = False
@@ -197,12 +225,17 @@ async def resume_agent(session_id: str):
     顶部检测到 interrupt_flag=False 后继续执行。
     """
     session = _get_session_or_404(session_id)
+    # 会话已死亡（终态）时拒绝恢复，防止前端误点击触发异常
+    _ensure_session_alive(session)
 
     # 先清除暂停/中断标志，保存到存储（循环会从存储同步这些标志）
     session.is_paused = False
     session.interrupt_flag = False
     session.is_executing = True
     session.pending_question = None
+    # 恢复执行时清除结束标记
+    session.end_reason = None
+    session.end_message = None
     get_agent_session_store().save(session)
 
     if is_agent_running(session_id):

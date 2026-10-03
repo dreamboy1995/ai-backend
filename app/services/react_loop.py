@@ -33,7 +33,17 @@ import time
 from typing import Any, Dict, List, Optional
 
 from app.config import settings
-from app.models.agent import AgentSession, TaskStep
+from app.models.agent import (
+    AgentSession,
+    END_REASON_ASK_USER,
+    END_REASON_COMPLETED,
+    END_REASON_ERROR,
+    END_REASON_MAX_ITER,
+    END_REASON_PAUSED,
+    END_REASON_TIMEOUT,
+    TaskStep,
+    TERMINAL_END_REASONS,
+)
 from app.services.agent_session_store import get_agent_session_store
 from app.services.agent_state_machine import AgentStateMachine
 from app.services.llm import AdapterError, chat_completion_text
@@ -167,6 +177,11 @@ def _extract_action_json(text: str) -> Optional[Dict[str, Any]]:
     有时仍会在 JSON 前后加 ```json 标记或解释文字。
     用正则提取第一个 { 到最后一个 } 之间的内容并解析。
 
+    额外的鲁棒性处理：
+      - 去除 markdown 代码围栏
+      - 移除对象/数组的尾随逗号（模型常见错误）
+      - 清理不可见控制字符（保留 \n \r \t）
+
     返回 {"tool": "...", "params": {...}} 或 None（解析失败）。
     """
     if not text:
@@ -177,14 +192,40 @@ def _extract_action_json(text: str) -> Optional[Dict[str, Any]]:
     end = text.rfind("}")
     if start == -1 or end == -1 or end <= start:
         return None
+    json_str = text[start : end + 1]
+
+    # 规范化 1：移除尾随逗号（,} 或 ,]），模型常见输出错误
+    json_str = re.sub(r",(\s*[}\]])", r"\1", json_str)
+
+    # 规范化 2：清理不可见控制字符（保留 \n \r \t）
+    json_str = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", json_str)
+
     try:
-        parsed = json.loads(text[start : end + 1])
+        parsed = json.loads(json_str)
     except json.JSONDecodeError as e:
-        logger.warning(f"[ReAct] Reason JSON 解析失败: {e}, raw={text[:200]}")
+        # 展示错误位置附近的上下文，便于定位（而非只截取前 200 字符）
+        pos = e.pos
+        ctx_start = max(0, pos - 80)
+        ctx_end = min(len(json_str), pos + 80)
+        context = json_str[ctx_start:ctx_end]
+        # 用 repr 展示，避免换行/控制字符干扰日志格式
+        logger.warning(
+            f"[ReAct] Reason JSON 解析失败: {e}, "
+            f"pos={pos}, context={context!r}"
+        )
         return None
     if not isinstance(parsed, dict):
         return None
     return parsed
+
+
+# Reason 重试时追加给模型的纠偏指令
+_REASON_RETRY_INSTRUCTION = (
+    "你上一次的输出不是合法的 JSON 对象。请严格只返回一个合法的 JSON 对象，"
+    "不要任何解释、问候语或 markdown 代码围栏标记。"
+    "如果 content 字段包含代码，其中的双引号必须转义为 \\\"，换行必须转义为 \\n。"
+    "JSON 格式：{\"tool\": \"工具名称\", \"params\": {...}}"
+)
 
 
 async def _reason(
@@ -193,32 +234,47 @@ async def _reason(
     """
     Reason（思考）阶段：让 LLM 决定当前步骤要调用的工具及参数。
 
+    支持重试：当模型输出解析失败时，追加纠偏指令后重试，
+    最多 REACT_MAX_RETRIES 次（含首次）。
+
     Returns:
-        {"tool": "...", "params": {...}} 或 None（模型调用失败 / 解析失败）
+        {"tool": "...", "params": {...}} 或 None（模型调用失败 / 重试耗尽仍解析失败）
     """
     messages = _build_reason_messages(session, step, sm)
-    try:
-        raw_output = await chat_completion_text(
-            messages=messages,
-            model=session.model,
-            temperature=settings.REACT_TEMPERATURE,
-            timeout=settings.REACT_STEP_TIMEOUT_SECONDS,
-            max_tokens=settings.REACT_MAX_TOKENS,
-            response_format={"type": "json_object"},
-        )
-    except AdapterError as e:
-        logger.error(f"[ReAct] Reason 模型调用失败 step={step.id}: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"[ReAct] Reason 异常 step={step.id}: {e}", exc_info=True)
-        return None
 
-    action = _extract_action_json(raw_output)
-    if action is None:
+    for attempt in range(1, settings.REACT_MAX_RETRIES + 1):
+        try:
+            raw_output = await chat_completion_text(
+                messages=messages,
+                model=session.model,
+                temperature=settings.REACT_TEMPERATURE,
+                timeout=settings.REACT_STEP_TIMEOUT_SECONDS,
+                max_tokens=settings.REACT_MAX_TOKENS,
+                response_format={"type": "json_object"},
+            )
+        except AdapterError as e:
+            logger.error(f"[ReAct] Reason 模型调用失败 step={step.id}: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"[ReAct] Reason 异常 step={step.id}: {e}", exc_info=True)
+            return None
+
+        action = _extract_action_json(raw_output)
+        if action is not None:
+            if attempt > 1:
+                logger.info(
+                    f"[ReAct] Reason 重试成功 step={step.id}, attempt={attempt}"
+                )
+            return action
+
         logger.warning(
-            f"[ReAct] Reason 未返回合法 action step={step.id}, raw={raw_output[:200]}"
+            f"[ReAct] Reason 未返回合法 action step={step.id}, "
+            f"attempt={attempt}/{settings.REACT_MAX_RETRIES}"
         )
-    return action
+        if attempt < settings.REACT_MAX_RETRIES:
+            messages.append({"role": "user", "content": _REASON_RETRY_INSTRUCTION})
+
+    return None
 
 
 # ============================================================
@@ -253,6 +309,36 @@ def _save_preserving_flags(session: AgentSession, store) -> None:
     """
     _reload_control_flags(session, store)
     store.save(session)
+
+
+def _mark_session_end(
+    session: AgentSession, end_reason: str, end_message: Optional[str] = None
+) -> None:
+    """
+    统一记录会话结束原因与描述。
+
+    所有退出点（暂停/完成/最大迭代/超时/异常，以及 ask_user）都应调用本方法，
+    确保 end_reason / end_message 字段被持久化，供前端判断会话是否已死亡。
+
+    Args:
+        session:     会话对象
+        end_reason:  结束原因（见 END_REASON_* 常量）
+        end_message: 结束的详细描述，None 时不覆盖已有值
+    """
+    session.end_reason = end_reason
+    if end_message is not None:
+        session.end_message = end_message
+    session.updated_at = time.time()
+
+
+def _fail_remaining_steps(sm: AgentStateMachine, reason: str) -> None:
+    """
+    将剩余 pending / running 步骤标记为 failed。
+
+    仅在终态退出（completed 存在失败步骤 / max_iter / timeout / error）时调用，
+    可恢复退出（paused / ask_user）不调用，以便 resume 后继续执行。
+    """
+    sm.fail_remaining_steps(reason)
 
 
 async def run_agent(
@@ -292,7 +378,8 @@ async def run_agent(
     sm = AgentStateMachine(session)
     start_time = time.time()
     iteration = 0
-    exit_reason = "completed"  # completed | paused | ask_user | max_iter | timeout | error
+    exit_reason = END_REASON_COMPLETED  # 默认 completed
+    end_message: Optional[str] = None  # 会话结束描述，对应 end_reason
 
     logger.info(
         f"[ReAct] 循环开始: session={session_id}, "
@@ -308,7 +395,8 @@ async def run_agent(
 
             # ---- 退出条件 1：中断标志（pause / ask_user 触发）----
             if session.interrupt_flag or session.is_paused:
-                exit_reason = "paused"
+                exit_reason = END_REASON_PAUSED
+                end_message = "用户暂停了执行"
                 logger.info(
                     f"[ReAct] 检测到中断标志，循环暂停: "
                     f"session={session_id}, iteration={iteration}"
@@ -317,34 +405,39 @@ async def run_agent(
 
             # ---- 退出条件 2：最大迭代次数（防止死循环）----
             if iteration > settings.REACT_MAX_ITERATIONS:
-                exit_reason = "max_iter"
+                exit_reason = END_REASON_MAX_ITER
                 msg = (
                     f"达到最大迭代次数 {settings.REACT_MAX_ITERATIONS}，Agent 停止执行"
                 )
                 session.final_answer = msg
+                end_message = msg
                 logger.warning(f"[ReAct] {msg}: session={session_id}")
                 break
 
             # ---- 退出条件 3：总超时 ----
             elapsed = time.time() - start_time
             if elapsed > settings.REACT_TOTAL_TIMEOUT_SECONDS:
-                exit_reason = "timeout"
+                exit_reason = END_REASON_TIMEOUT
                 msg = (
                     f"执行超时（{settings.REACT_TOTAL_TIMEOUT_SECONDS}s），Agent 停止执行"
                 )
                 session.final_answer = msg
+                end_message = msg
                 logger.warning(f"[ReAct] {msg}: session={session_id}")
                 break
 
             # ---- 获取下一个可执行步骤 ----
             step = sm.get_next_runnable_step()
             if step is None:
-                exit_reason = "completed"
+                exit_reason = END_REASON_COMPLETED
                 if sm.is_all_done():
                     session.final_answer = "所有任务步骤已完成"
+                    end_message = "所有任务步骤已完成"
                     logger.info(f"[ReAct] 所有步骤完成: session={session_id}")
                 else:
-                    session.final_answer = "无可用执行步骤（存在失败或阻塞的步骤）"
+                    msg = "无可用执行步骤（存在失败或阻塞的步骤）"
+                    session.final_answer = msg
+                    end_message = msg
                     logger.info(
                         f"[ReAct] 无可用步骤: session={session_id}, "
                         f"summary={sm.summary()}"
@@ -366,7 +459,8 @@ async def run_agent(
             _reload_control_flags(session, store)
             if session.interrupt_flag or session.is_paused:
                 sm.reset_step(step.id)  # running -> pending，供 resume 后重试
-                exit_reason = "paused"
+                exit_reason = END_REASON_PAUSED
+                end_message = "用户暂停了执行"
                 _save_preserving_flags(session, store)
                 logger.info(
                     f"[ReAct] Reason 期间检测到暂停请求，回收步骤 {step.id} 并退出"
@@ -391,12 +485,13 @@ async def run_agent(
             # 当 Agent 遇到关键决策时，返回 {"tool": "ask_user", "params": {"question": "..."}}
             # 此时循环暂停，将问题推送给 Builder 面板，等待用户输入后再继续。
             if tool == "ask_user":
-                exit_reason = "ask_user"
+                exit_reason = END_REASON_ASK_USER
                 question = str(params.get("question", "")).strip() or "请提供输入"
                 session.pending_question = question
                 session.is_executing = False
                 session.is_paused = True
                 session.interrupt_flag = True
+                end_message = f"等待用户回答问题：{question}"
                 store.save(session)  # ask_user 由循环自身设置标志，直接保存
                 logger.info(
                     f"[ReAct] 步骤 {step.id} 请求人工介入，循环暂停: "
@@ -431,20 +526,34 @@ async def run_agent(
 
     except Exception as e:
         # 循环顶层兜底，避免未捕获异常导致后台任务静默失败
-        exit_reason = "error"
+        exit_reason = END_REASON_ERROR
+        msg = f"Agent 执行异常: {e}"
         logger.error(f"[ReAct] 循环未捕获异常: session={session_id}: {e}", exc_info=True)
-        session.final_answer = f"Agent 执行异常: {e}"
+        session.final_answer = msg
+        end_message = msg
 
     finally:
         # 循环结束，根据退出原因更新控制标志
         session.is_executing = False
-        if exit_reason in ("ask_user", "paused"):
+        if exit_reason in (END_REASON_ASK_USER, END_REASON_PAUSED):
             # ask_user 或用户主动暂停：保持暂停状态，等待 resume / ask/respond
             pass
         else:
             # completed / max_iter / timeout / error：清除暂停标志，进入终态
             session.is_paused = False
             session.interrupt_flag = False
+
+        # 统一标记会话结束原因与描述（所有退出点都走这里）
+        _mark_session_end(session, exit_reason, end_message)
+
+        # 终态退出时，将剩余 pending/running 步骤标记为 failed，
+        # 避免前端看到"卡住的 pending 步骤"。
+        # 可恢复退出（paused / ask_user）保留 pending 状态以便 resume 后继续。
+        if exit_reason in TERMINAL_END_REASONS:
+            _fail_remaining_steps(
+                sm, end_message or "会话结束，步骤未执行"
+            )
+
         store.save(session)
         logger.info(
             f"[ReAct] 循环结束: session={session_id}, reason={exit_reason}, "
@@ -520,6 +629,9 @@ async def resume_agent_loop(
     session.interrupt_flag = False
     session.is_executing = True
     session.pending_question = None
+    # 恢复执行时清除结束标记，表示会话重新进入运行态
+    session.end_reason = None
+    session.end_message = None
     store.save(session)
 
     return await start_agent_loop(session_id, tool_executor)
@@ -577,6 +689,9 @@ async def handle_ask_user_response(session_id: str, answer: str) -> bool:
     session.is_paused = False
     session.interrupt_flag = False
     session.is_executing = True
+    # 用户回复后继续执行，清除结束标记
+    session.end_reason = None
+    session.end_message = None
     store.save(session)
 
     return await start_agent_loop(session_id)

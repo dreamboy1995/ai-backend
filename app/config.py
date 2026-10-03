@@ -223,7 +223,11 @@ class Settings(BaseSettings):
     # Reason 阶段采样温度。较低温度让工具选择更稳定、可复现。
     REACT_TEMPERATURE: float = 0.2
     # Reason 阶段 max_tokens
-    REACT_MAX_TOKENS: int = 1024
+    # 注意：write_file 工具的 content 字段可能包含大段源代码（如 Vue 组件），
+    # 1024 tokens 会导致 JSON 被截断从而解析失败。这里给 8192 以容纳大文件内容。
+    REACT_MAX_TOKENS: int = 8192
+    # Reason 阶段最大重试次数（解析失败时重试，类似 Planner 的 PLANNER_MAX_RETRIES）
+    REACT_MAX_RETRIES: int = 2
     # 上下文窗口（应对上下文爆炸）：只保留最近 N 个已完成步骤的完整 observation，
     # 更早的步骤只保留摘要（description + status）。
     # 对应 S7 风险预警："ReAct 循环中的上下文爆炸……只保留最近 3 步的完整观察结果"
