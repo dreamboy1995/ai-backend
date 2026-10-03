@@ -60,6 +60,16 @@ class Settings(BaseSettings):
     INLINE_CHAT_TIMEOUT_SECONDS: float = 120.0  # Inline Chat 超时（秒）
     INLINE_CHAT_MAX_TOKENS: int = 8192          # Inline Chat 默认 max_tokens
 
+    # S6 第 59-60 天：多文件 JSON 输出超时保护
+    # 当 response_format=json_object（多文件修改场景）时，模型需要同时思考
+    # 多个文件的修改，容易出现"思考时间过长"导致用户长时间等待。
+    # 为避免用户无感知地等待，对 JSON 模式单独设置更短的超时（30 秒），
+    # 超时后强制终止并返回友好提示 "生成时间过长，请简化需求重试"。
+    # 该超时覆盖 mode 维度的超时（chat=60 / new=120 / inline=120），
+    # 即只要开启 JSON Mode，就以本配置为准。
+    JSON_MODE_TIMEOUT_SECONDS: float = 30.0     # 多文件 JSON 输出超时（秒）
+    JSON_MODE_TIMEOUT_MESSAGE: str = "生成时间过长，请简化需求重试"  # 超时友好提示
+
     # S4 第 33-34 天：代码向量化配置
     # embedding_mode:
     #   - "local"  : 使用本地 sentence-transformers 模型（all-MiniLM-L6-v2，384 维）

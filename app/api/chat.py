@@ -440,6 +440,20 @@ async def chat_completions(
             request_timeout = settings.CHAT_TIMEOUT_SECONDS
             default_max_tokens = settings.CHAT_MAX_TOKENS
 
+        # S6 第 59-60 天：多文件 JSON 输出超时保护
+        # 当 response_format=json_object（多文件修改场景）时，模型需要同时思考
+        # 多个文件的修改，容易出现"思考时间过长"。为避免用户无感知地等待，
+        # 对 JSON 模式单独设置更短的超时（默认 30 秒），覆盖 mode 维度的超时。
+        # 超时后强制终止并返回友好提示 "生成时间过长，请简化需求重试"。
+        is_json_mode = request.response_format is not None
+        if is_json_mode:
+            original_timeout = request_timeout
+            request_timeout = settings.JSON_MODE_TIMEOUT_SECONDS
+            logger.info(
+                f"[Chat] JSON Mode 超时保护已启用: "
+                f"原超时={original_timeout}s → JSON 模式超时={request_timeout}s"
+            )
+
         # S6 第 53-54 天：将 messages 从 adapter_params 中分离，
         # 便于 JSON Mode 解析失败重试时传入追加了强化指令的消息列表。
         base_adapter_params = {
@@ -614,8 +628,18 @@ async def chat_completions(
                     logger.warning(f"Token too long error: {e.message}")
                     yield f'data: {{"error": {{"code": {e.code}, "msg": "{e.message}"}}}}\n\n'
                 except AdapterTimeoutError as e:
-                    logger.warning(f"Timeout error: {e.message}")
-                    yield f'data: {{"error": {{"code": {e.code}, "msg": "{e.message}"}}}}\n\n'
+                    # S6 第 59-60 天：JSON 模式超时时返回友好提示，
+                    # 引导用户简化需求（多文件修改场景对模型推理压力大）。
+                    if is_json_mode:
+                        timeout_msg = settings.JSON_MODE_TIMEOUT_MESSAGE
+                        logger.warning(
+                            f"[Chat] JSON Mode 超时（>{settings.JSON_MODE_TIMEOUT_SECONDS}s），"
+                            f"返回友好提示: {timeout_msg}"
+                        )
+                        yield f'data: {{"error": {{"code": {e.code}, "msg": "{timeout_msg}"}}}}\n\n'
+                    else:
+                        logger.warning(f"Timeout error: {e.message}")
+                        yield f'data: {{"error": {{"code": {e.code}, "msg": "{e.message}"}}}}\n\n'
                 except AdapterNetworkError as e:
                     logger.warning(f"Network error: {e.message}")
                     yield f'data: {{"error": {{"code": {e.code}, "msg": "{e.message}"}}}}\n\n'
