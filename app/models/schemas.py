@@ -388,8 +388,56 @@ class ChatDiffChunk(BaseModel):
         ]}
 
     S6 风险预警应对（Diff 数据量过大）：
-    - 当 files 数量超过 3 个时，后端会拆分为多个 type:diff 块分片推送，
-      每个块只包含部分文件，避免单个 SSE 包过大。插件需聚合所有 diff 块。
+        - 当 files 数量超过 3 个时，后端会拆分为多个 type:diff 块分片推送，
+          每个块只包含部分文件，避免单个 SSE 包过大。插件需聚合所有 diff 块。
     """
     type: Literal["diff"] = "diff"
     files: List[DiffFileItem] = []
+
+
+# ============================================================
+# S6 第 57-58 天：Cue 编辑位置预测接口（POST /v1/cue/suggest）
+# ============================================================
+
+class CueSuggestRequest(BaseModel):
+    """
+    S6 第 57-58 天：Cue 编辑位置预测请求。
+
+    插件监听用户编辑事件（onDidChangeTextDocument / onDidChangeSelection），
+    将最近的编辑上下文打包发给后端，由后端利用 S4 构建的 AST 依赖图
+    （Call Graph）与符号表返回"可能受影响的文件列表"，作为插件端 Cue
+    灰色箭头提示的数据来源（S4 依赖图的首次实战应用）。
+
+    三种 action 对应插件端三条启发式规则（详见 Sprint_6.md 第 57-58 天）：
+      - "rename":     规则 A（依赖跟随）— 函数改名后跟随所有调用点。
+                       symbol_name 为被改名的旧符号名。
+      - "delete":     类似 rename，但符号是被删除的，调用方需替换或移除。
+      - "add_method":  规则 C（相似结构补全）— 用户新增了一个方法，后端
+                       返回其他文件中已存在的同名方法，提示"是否也要修改这里？"。
+    """
+    file_path: str = Field(..., min_length=1, description="用户当前编辑的文件路径（相对路径）")
+    modified_line: int = Field(..., ge=1, description="被改动的行号（1-based）")
+    action: Literal["rename", "delete", "add_method"] = Field(..., description="编辑动作类型")
+    symbol_name: str = Field(..., min_length=1, description="被改名的符号名（rename 时为旧名）")
+
+
+class CueSuggestionItem(BaseModel):
+    """
+    单条 Cue 预测建议。
+
+    插件端在编辑器行号旁渲染半透明灰色小箭头（▶）或 "Cue" 徽章，
+    鼠标悬停显示 reason，点击直接跳转到 (file_path, line)。
+    弱视觉设计（灰色小点，而非亮色大按钮）由插件实现，
+    用于缓解 S6 风险预警中的"Cue 规则误报"问题。
+    """
+    file_path: str = Field(..., description="建议跳转的目标文件（POSIX 相对路径）")
+    line: int = Field(..., ge=1, description="建议跳转的目标行号（1-based）")
+    reason: str = Field(..., description="提示原因（如：此函数调用了被改名的符号）")
+
+
+class CueSuggestResponse(BaseModel):
+    """Cue 预测响应。"""
+    action: str
+    symbol_name: str
+    total: int = 0
+    suggestions: List[CueSuggestionItem] = []

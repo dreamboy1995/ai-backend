@@ -27,6 +27,7 @@ from app.api.models import router as models_router
 from app.api.index import router as index_router
 from app.api.graph import router as graph_router
 from app.api.symbols import router as symbols_router
+from app.api.cue import router as cue_router
 
 # 日志配置必须在所有日志调用之前执行
 setup_logging()
@@ -101,6 +102,8 @@ def create_app() -> FastAPI:
     app.include_router(graph_router, prefix="/v1/graph", tags=["依赖图"])
     # S5 第 43-44 天：符号实时补全接口（# 输入触发）
     app.include_router(symbols_router, prefix="/v1/symbols", tags=["符号搜索"])
+    # S6 第 57-58 天：Cue 编辑位置预测接口（启发式规则后端辅助）
+    app.include_router(cue_router, prefix="/v1/cue", tags=["Cue 预测"])
 
     # 基础路由
     @app.get("/", tags=["默认"])

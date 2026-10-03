@@ -478,6 +478,81 @@ class SymbolExactMatcher:
         return results[:top_k]
 
     # ------------------------------------------------------------
+    # 同名符号查找（用于 Cue 规则 C：相似结构补全）
+    # ------------------------------------------------------------
+
+    def find_related_symbols(
+        self,
+        name: str,
+        exclude_file: Optional[str] = None,
+        top_k: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """
+        查找与指定符号同名的其他符号定义（用于 Cue 规则 C：相似结构补全）。
+
+        场景：用户刚在 class A 中新增了方法 `foo`（action=add_method），
+        后端查找其他文件中同样名为 `foo` 的符号定义，提示用户
+        "是否也要修改这里？"。这是 S4 符号表（ast_parser 输出）的
+        首次跨文件实战应用。
+
+        与 find_callers 的区别：
+          - find_callers 查找调用方（谁调用了 foo）— 用于 rename/delete。
+            但 add_method 时新方法尚未被调用，find_callers 召回为空，
+            故必须改用符号表查找同名定义。
+          - find_related_symbols 查找同名定义（其他类也定义了 foo）— 用于 add_method。
+
+        Args:
+            name:         符号名（如 "foo"）
+            exclude_file: 排除的文件路径（用户当前编辑的文件，避免重复提示）。
+                          传相对路径或 POSIX 路径均可，内部会归一化。
+            top_k:        返回前 K 条
+
+        Returns:
+            同名符号定义列表，每项含：
+              - file_path:    符号所在文件（POSIX 相对路径）
+              - line:         符号起始行号（1-based）
+              - symbol_name:  符号名
+              - symbol_type:  符号类型（class / function / variable）
+        """
+        if not name:
+            return []
+
+        try:
+            svc = self._get_index_service()
+        except Exception as e:
+            logger.debug(f"[SymbolExactMatcher] IndexService 不可用: {e}")
+            return []
+
+        with svc._lock:
+            file_tables = list(svc._index.items())
+
+        exclude_norm = normalize_path(exclude_file) if exclude_file else None
+        name_lower = name.lower()
+
+        results: List[Dict[str, Any]] = []
+        for file_path, table in file_tables:
+            norm_path = normalize_path(file_path)
+            # 排除用户当前编辑的文件（同文件由插件 Rule C 自行处理）
+            if exclude_norm and norm_path == exclude_norm:
+                continue
+            for sym in table.symbols:
+                if sym.name and sym.name.lower() == name_lower:
+                    results.append({
+                        "file_path": norm_path,
+                        "line": sym.start_line,
+                        "symbol_name": sym.name,
+                        "symbol_type": (
+                            sym.symbol_type.value
+                            if hasattr(sym.symbol_type, "value")
+                            else str(sym.symbol_type)
+                        ),
+                    })
+
+        # 按文件路径 + 行号排序，便于阅读
+        results.sort(key=lambda x: (x["file_path"], x["line"]))
+        return results[:top_k]
+
+    # ------------------------------------------------------------
     # 符号补全（用于 /v1/symbols/search 实时下拉）
     # ------------------------------------------------------------
 

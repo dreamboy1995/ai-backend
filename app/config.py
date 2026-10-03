@@ -159,6 +159,12 @@ class Settings(BaseSettings):
     RETRIEVAL_CACHE_ENABLED: bool = True
     RETRIEVAL_CACHE_TTL_SECONDS: int = 300  # 5 分钟
 
+    # S6 第 57-58 天：Cue 编辑位置预测配置
+    # 单次 /v1/cue/suggest 返回的最大建议数量上限。
+    # 风险预警（Cue 规则误报）：启发式规则必然有误报，限制返回数量
+    # 避免在编辑器上渲染过多灰色箭头干扰用户（弱视觉设计由插件实现）。
+    CUE_SUGGEST_MAX: int = 20
+
     # S5 第 47-48 天：智能上下文组装器配置
     # 上下文组装器对 hybrid_search 召回的 Top-K Chunk 做智能压缩与 Token 预算控制。
     #
