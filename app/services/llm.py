@@ -582,3 +582,50 @@ class AdapterFactory:
             await adapter.close()
         cls._instances.clear()
         logger.info("[AdapterFactory] 所有适配器连接已关闭")
+
+
+# ============================================================
+# 非流式调用辅助（S7 第 63-64 天：Planner 需要完整文本）
+# ============================================================
+
+async def chat_completion_text(
+    messages: list,
+    model: str,
+    temperature: float = 0.7,
+    timeout: Optional[float] = None,
+    **kwargs
+) -> str:
+    """
+    非流式调用模型，返回完整文本内容。
+
+    适配器的 chat_completion 只提供流式接口，本函数内部以 stream=True 调用
+    并聚合所有 content delta，适用于 Planner 等需要一次性拿到完整输出的场景。
+
+    Args:
+        messages:    OpenAI 格式的消息列表
+        model:       模型 ID
+        temperature: 采样温度
+        timeout:     本次请求超时（秒），None 时使用适配器默认值
+        **kwargs:    透传给适配器的额外参数（如 response_format / max_tokens）
+
+    Returns:
+        模型输出的完整文本
+    """
+    adapter = AdapterFactory.get_adapter(model)
+    parts: List[str] = []
+    async for chunk in adapter.chat_completion(
+        messages=messages,
+        model=model,
+        temperature=temperature,
+        stream=True,
+        timeout=timeout,
+        **kwargs,
+    ):
+        choices = chunk.get("choices", [])
+        if not choices:
+            continue
+        delta = choices[0].get("delta", {})
+        content = delta.get("content")
+        if content:
+            parts.append(content)
+    return "".join(parts)

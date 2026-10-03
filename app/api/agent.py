@@ -29,13 +29,13 @@ from app.models.agent import (
     PlanPreviewItem,
     PlanRequest,
     PlanResponse,
-    TaskStep,
 )
 from app.services.agent_session_store import get_agent_session_store
 from app.services.agent_state_machine import (
     AgentStateMachine,
     InvalidPlanError,
 )
+from app.services.planner import PlannerError, plan as planner_plan
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -57,15 +57,25 @@ async def create_plan(req: PlanRequest):
     """
     创建 Agent 任务计划。
 
-    S7 第 63-64 天将接入 Planner，由大模型将自然语言需求拆解为 DAG 任务图。
-    当前阶段（第 61-62 天）支持两种方式：
-      1. 调用方在 req.plan 中直接传入预拆解的步骤列表（测试/联调用）。
-      2. 未传入时，后端生成一个默认占位计划，用于验证状态机与 UI 联通。
+    S7 第 63-64 天已接入 Planner：当调用方未传入预拆解计划时，
+    由大模型将自然语言需求拆解为 DAG 任务图（含步骤数量校验、依赖合法性校验、
+    解析失败自动重试）。
+    调用方也可在 req.plan 中直接传入预拆解的步骤列表（测试/联调用）。
     """
     plan_steps = req.plan
     if plan_steps is None:
-        # 生成默认占位计划（S7 第 63-64 天替换为真实 Planner 输出）
-        plan_steps = _generate_default_plan(req.goal)
+        # 调用 Planner 生成任务计划（S7 第 63-64 天）
+        try:
+            plan_steps = await planner_plan(
+                goal=req.goal,
+                workspace_root=req.workspace_root,
+                model=req.model,
+            )
+        except PlannerError as e:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Planner 生成任务计划失败: {e}",
+            )
 
     session = AgentSession(
         user_goal=req.goal,
@@ -195,40 +205,3 @@ async def respond_to_ask_user(req: AskUserRespondRequest):
     )
     return AskUserRespondResponse(success=True, message="回复已接收，Agent 继续执行")
 
-
-# ------------------------------------------------------------------
-# 默认占位计划生成器（S7 第 63-64 天替换为 Planner）
-# ------------------------------------------------------------------
-
-def _generate_default_plan(goal: str) -> list[TaskStep]:
-    """
-    生成默认占位计划，用于在 Planner 未实现前验证状态机与 UI。
-
-    真实 Planner 会在第 63-64 天接入，届时此方法将被移除。
-    """
-    return [
-        TaskStep(
-            id="step_1",
-            description="分析需求",
-            details=f"分析用户需求：{goal}，确定技术栈与项目结构",
-            dependencies=[],
-            action="search_code",
-            action_input={"query": goal},
-        ),
-        TaskStep(
-            id="step_2",
-            description="初始化项目",
-            details="创建项目目录结构，初始化版本控制与配置文件",
-            dependencies=["step_1"],
-            action="run_command",
-            action_input={"cmd": "mkdir project && cd project && git init"},
-        ),
-        TaskStep(
-            id="step_3",
-            description="实现核心功能",
-            details="根据需求实现核心业务逻辑",
-            dependencies=["step_2"],
-            action="write_file",
-            action_input={"path": "src/main.py", "content": "# TODO: implement"},
-        ),
-    ]

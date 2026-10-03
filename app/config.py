@@ -195,6 +195,22 @@ class Settings(BaseSettings):
     CONTEXT_ASSEMBLY_HEAD_LINES: int = 10
     CONTEXT_ASSEMBLY_TAIL_LINES: int = 10
 
+    # S7 第 63-64 天：Planner 任务规划器配置
+    # 步骤数量范围（S7 风险预警：Planner 输出不稳定，同一需求每次生成的步骤数波动大，
+    # 必须在 System Prompt 中给死范围，并在解析后校验，过少或过多触发重新生成）
+    PLANNER_MIN_STEPS: int = 5
+    PLANNER_MAX_STEPS: int = 10
+    # Planner 调用最大尝试次数（首次 + 重试）。解析失败或校验失败时重试一次。
+    PLANNER_MAX_RETRIES: int = 2
+    # Planner 单次模型调用超时（秒）。规划需要较充分推理，给较长超时。
+    PLANNER_TIMEOUT_SECONDS: float = 120.0
+    # Planner 采样温度。较低温度保证输出稳定、可复现。
+    PLANNER_TEMPERATURE: float = 0.3
+    # Planner 推理输出 max_tokens
+    PLANNER_MAX_TOKENS: int = 4096
+    # Planner Prompt 输入输出记录目录（供后续 P4 阶段微调模型使用）
+    PLANNER_LOG_DIR: str = ".ai_planner_logs"
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
