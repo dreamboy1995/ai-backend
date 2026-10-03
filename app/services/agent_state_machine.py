@@ -281,9 +281,11 @@ class AgentStateMachine:
 
     def reset_step(self, step_id: str) -> TaskStep:
         """
-        重置步骤为 pending（用于重试 failed 步骤）。
+        重置步骤为 pending（用于重试 failed 步骤，或暂停时回收 running 步骤）。
 
-        合法迁移: failed -> pending, blocked -> pending
+        合法迁移: failed -> pending, blocked -> pending, running -> pending
+        - failed/blocked 重试时 retry_count + 1
+        - running 回收（暂停场景）不增加 retry_count，因为该步骤尚未真正执行失败
         """
         with self._lock:
             step = self.get_step(step_id)
@@ -291,18 +293,21 @@ class AgentStateMachine:
                 raise StateTransitionError(f"步骤不存在: {step_id}")
             if step.status == "pending":
                 return step
-            if step.status not in ("failed", "blocked"):
+            if step.status not in ("failed", "blocked", "running"):
                 raise StateTransitionError(
                     f"步骤 '{step_id}' 状态为 {step.status}，无法重置"
-                    f"（仅 failed/blocked 可重置为 pending）"
+                    f"（仅 failed/blocked/running 可重置为 pending）"
                 )
+            was_running = step.status == "running"
             step.status = "pending"
             step.observation = None
-            step.retry_count += 1
+            if not was_running:
+                step.retry_count += 1
             self._session.updated_at = time.time()
             logger.info(
-                f"[StateMachine] 步骤重置重试: {step_id} "
-                f"(retry_count={step.retry_count})"
+                f"[StateMachine] 步骤重置为 pending: {step_id} "
+                f"(from={'running' if was_running else 'failed/blocked'}, "
+                f"retry_count={step.retry_count})"
             )
             return step
 

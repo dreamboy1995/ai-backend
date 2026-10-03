@@ -211,6 +211,24 @@ class Settings(BaseSettings):
     # Planner Prompt 输入输出记录目录（供后续 P4 阶段微调模型使用）
     PLANNER_LOG_DIR: str = ".ai_planner_logs"
 
+    # S7 第 67-68 天：ReAct 执行循环配置
+    # 最大迭代次数（防止 AI 陷入死循环，比如反复重试同一个失败步骤）。
+    # 对应 S7 风险预警："ReAct 循环的退出条件：必须设置最大迭代次数（如 15 次）"
+    REACT_MAX_ITERATIONS: int = 15
+    # 单次会话总超时（秒），防止长时间运行的 Agent 占用资源。
+    # 对应 S7 风险预警："总超时（2 分钟）"
+    REACT_TOTAL_TIMEOUT_SECONDS: float = 120.0
+    # 单步 Reason 模型调用超时（秒）。单步推理不需要太长，给 60s。
+    REACT_STEP_TIMEOUT_SECONDS: float = 60.0
+    # Reason 阶段采样温度。较低温度让工具选择更稳定、可复现。
+    REACT_TEMPERATURE: float = 0.2
+    # Reason 阶段 max_tokens
+    REACT_MAX_TOKENS: int = 1024
+    # 上下文窗口（应对上下文爆炸）：只保留最近 N 个已完成步骤的完整 observation，
+    # 更早的步骤只保留摘要（description + status）。
+    # 对应 S7 风险预警："ReAct 循环中的上下文爆炸……只保留最近 3 步的完整观察结果"
+    REACT_CONTEXT_WINDOW: int = 3
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
