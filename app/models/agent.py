@@ -1,0 +1,187 @@
+"""
+S7 第 61-62 天：Agent 核心数据结构定义
+
+定义 Agent 状态机所需的 Pydantic 模型，以及 S7 新增接口的请求/响应 DTO。
+
+关键设计点（兼顾 S7 风险预警）：
+1. TaskStep.status 使用 Literal 限定合法状态，避免非法状态写入。
+2. AgentSession 持久化到 Redis（见 agent_session_store.py），应对
+   "用户中途关闭 VS Code" 导致会话丢失的风险。
+3. 预留 is_paused / interrupt_flag / pending_question 字段，为
+   第 69-70 天的暂停/人工介入机制铺路，当前阶段状态机已能识别这些字段。
+4. ToolExecutor 抽象基类在 app/services/tool_executor.py 中定义，
+   采用依赖注入（DI）：S7 注入 MockToolExecutor，S8 替换为 MCPToolExecutor，
+   上层循环代码无需修改。
+"""
+
+import time
+import uuid
+from typing import Any, Dict, List, Literal, Optional
+
+from pydantic import BaseModel, Field
+
+
+# ============================================================
+# Agent 核心状态数据结构
+# ============================================================
+
+StepStatus = Literal["pending", "running", "done", "failed", "blocked"]
+SUGGESTED_TOOLS = Literal["write_file", "run_command", "search_code", "ask_user"]
+
+
+class TaskStep(BaseModel):
+    """
+    Agent 任务图中的单个步骤节点。
+
+    每个步骤对应一个可执行动作（工具调用），通过 dependencies 形成 DAG。
+    状态机（agent_state_machine.py）负责驱动步骤在 pending -> running -> done/failed 之间流转。
+    """
+
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()), description="步骤唯一 ID（uuid）")
+    description: str = Field(..., min_length=1, description="步骤简短描述（10 字以内）")
+    details: str = Field(default="", description="步骤详细说明，包括具体技术选型")
+    status: StepStatus = Field(default="pending", description="步骤状态")
+    dependencies: List[str] = Field(default_factory=list, description="依赖的前置步骤 ID 列表")
+    action: str = Field(default="", description="工具名称，如 write_file / run_command")
+    action_input: Dict[str, Any] = Field(default_factory=dict, description="工具参数")
+    observation: Optional[str] = Field(default=None, description="执行结果反馈（Observe 阶段写入）")
+    retry_count: int = Field(default=0, ge=0, description="已重试次数")
+    # 建议使用的工具（Planner 输出字段，状态机不直接使用，仅供 UI 展示与调试）
+    suggested_tool: Optional[SUGGESTED_TOOLS] = Field(default=None, description="Planner 建议的工具")
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "id": "step_1",
+                "description": "初始化项目结构",
+                "details": "创建前后端分离目录，初始化 package.json",
+                "status": "pending",
+                "dependencies": [],
+                "action": "run_command",
+                "action_input": {"cmd": "mkdir backend frontend && cd backend && npm init -y"},
+                "observation": None,
+                "retry_count": 0,
+                "suggested_tool": "run_command",
+            }
+        }
+    }
+
+
+class AgentSession(BaseModel):
+    """
+    Agent 会话：承载一次完整的"需求拆解 -> 分步执行"流程。
+
+    持久化到 Redis（JSON），Redis 不可用时降级为内存存储。
+    用户中途关闭 VS Code 后，下次打开插件可从 Redis 恢复未完成的会话。
+    """
+
+    session_id: str = Field(default_factory=lambda: str(uuid.uuid4()), description="会话唯一 ID")
+    user_goal: str = Field(..., min_length=1, description="原始用户需求")
+    workspace_root: str = Field(default="", description="工作区根路径")
+    model: str = Field(default="glm-4.5-air", description="执行 Agent 使用的模型")
+    plan: List[TaskStep] = Field(default_factory=list, description="任务步骤列表（DAG）")
+    current_step_index: int = Field(default=-1, description="当前正在执行的步骤索引，-1 表示未开始")
+    final_answer: Optional[str] = Field(default=None, description="所有步骤完成后的最终总结")
+    # 执行控制字段（第 69-70 天暂停/人工介入机制使用，状态机已识别）
+    is_paused: bool = Field(default=False, description="是否已暂停")
+    is_executing: bool = Field(default=False, description="Agent 循环是否正在执行")
+    interrupt_flag: bool = Field(default=False, description="中断标志，循环顶部检查")
+    pending_question: Optional[str] = Field(default=None, description="待用户回答的问题（ask_user 工具）")
+    # 时间戳
+    created_at: float = Field(default_factory=time.time, description="创建时间戳")
+    updated_at: float = Field(default_factory=time.time, description="最后更新时间戳")
+
+    @property
+    def total_steps(self) -> int:
+        """总步骤数"""
+        return len(self.plan)
+
+    @property
+    def done_steps(self) -> int:
+        """已完成步骤数"""
+        return sum(1 for s in self.plan if s.status == "done")
+
+    @property
+    def progress(self) -> float:
+        """整体进度（0.0 ~ 1.0）"""
+        if self.total_steps == 0:
+            return 0.0
+        return self.done_steps / self.total_steps
+
+
+# ============================================================
+# S7 新增接口请求/响应 DTO
+# ============================================================
+
+class PlanRequest(BaseModel):
+    """
+    POST /v1/agent/plan 请求体。
+
+    接收用户需求，由 Planner 拆解为任务图并创建 AgentSession。
+    S7 第 63-64 天实现 Planner；第 61-62 天接口已就位，
+    当未传入 plan 时后端会生成默认占位计划用于联调。
+    """
+
+    goal: str = Field(..., min_length=1, description="用户原始开发需求")
+    workspace_root: str = Field(default="", description="工作区根路径")
+    model: str = Field(default="glm-4.5-air", description="使用的模型")
+    # 允许调用方直接传入预拆解的步骤（测试/联调用）；
+    # 正常流程由 Planner 生成，此字段为空。
+    plan: Optional[List[TaskStep]] = Field(default=None, description="预拆解的步骤列表（可选）")
+
+
+class PlanPreviewItem(BaseModel):
+    """计划预览项（仅返回 id + description，供前端快速展示）"""
+
+    id: str
+    description: str
+
+
+class PlanResponse(BaseModel):
+    """POST /v1/agent/plan 响应体"""
+
+    session_id: str
+    plan_preview: List[PlanPreviewItem]
+
+
+class AgentStatusResponse(BaseModel):
+    """
+    GET /v1/agent/status/{session_id} 响应体。
+
+    返回 AgentSession 完整状态，供 Builder 面板每秒轮询刷新。
+    包含每一步的状态、观察结果，以及整体进度。
+    """
+
+    session_id: str
+    user_goal: str
+    workspace_root: str
+    steps: List[TaskStep]
+    current_step_index: int
+    final_answer: Optional[str]
+    progress: float
+    is_executing: bool
+    is_paused: bool
+    pending_question: Optional[str]
+    total_steps: int
+    done_steps: int
+
+
+class AskUserRespondRequest(BaseModel):
+    """POST /v1/agent/ask/respond 请求体（人工介入回复）"""
+
+    session_id: str = Field(..., min_length=1)
+    answer: str = Field(..., min_length=1, description="用户对 ask_user 问题的回答")
+
+
+class AskUserRespondResponse(BaseModel):
+    """POST /v1/agent/ask/respond 响应体"""
+
+    success: bool
+    message: str
+
+
+class AgentActionResponse(BaseModel):
+    """start / pause / resume 等控制类接口的通用响应"""
+
+    success: bool
+    message: str
