@@ -124,6 +124,7 @@ async def get_status(session_id: str):
         current_step_index=session.current_step_index,
         final_answer=session.final_answer,
         progress=session.progress,
+        progress_percent=int(round(session.progress * 100)),
         is_executing=session.is_executing,
         is_paused=session.is_paused,
         pending_question=session.pending_question,

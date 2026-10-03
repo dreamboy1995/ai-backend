@@ -44,6 +44,11 @@ RATE_LIMITED_PREFIX = "/v1/"
 # - /v1/index/status: 索引进度查询（前端索引过程中会高频轮询）
 RATE_LIMIT_EXEMPT_PATHS = {"/v1/user/usage", "/v1/index/status"}
 
+# 不限频的路径前缀（含动态路径参数的轮询接口，无法用精确匹配）
+# - /v1/agent/status: S7 第 65-66 天 Builder 面板每秒轮询 Agent 状态，
+#   若不限频会在 20 秒内触发分钟限频（20次/分钟），导致面板状态刷新中断。
+RATE_LIMIT_EXEMPT_PREFIXES = ("/v1/agent/status",)
+
 # 窗口定义：(窗口秒数, 最大请求数, 配置项)
 _WINDOW_MINUTE = 60       # 每分钟窗口
 _WINDOW_DAY = 86400       # 每天窗口（24h）
@@ -354,7 +359,11 @@ async def rate_limiter_middleware(request: Request, call_next):
     path = request.url.path
 
     # 仅对 /v1/ 前缀的业务接口限频；排除状态查询等轻量接口
-    if not path.startswith(RATE_LIMITED_PREFIX) or path in RATE_LIMIT_EXEMPT_PATHS:
+    if (
+        not path.startswith(RATE_LIMITED_PREFIX)
+        or path in RATE_LIMIT_EXEMPT_PATHS
+        or any(path.startswith(p) for p in RATE_LIMIT_EXEMPT_PREFIXES)
+    ):
         return await call_next(request)
 
     # 获取 user_id（由 auth 中间件写入 request.state）

@@ -150,6 +150,11 @@ class AgentStatusResponse(BaseModel):
 
     返回 AgentSession 完整状态，供 Builder 面板每秒轮询刷新。
     包含每一步的状态、观察结果，以及整体进度。
+
+    进度字段：
+      - progress: 0.0 ~ 1.0 的小数进度
+      - progress_percent: 0 ~ 100 的整数进度（Builder 面板直接使用，
+        对应 S7 接口规范 BuilderState.progress: number // 0-100）
     """
 
     session_id: str
@@ -159,6 +164,7 @@ class AgentStatusResponse(BaseModel):
     current_step_index: int
     final_answer: Optional[str]
     progress: float
+    progress_percent: int = Field(description="整体进度百分比 0-100，供 Builder 面板直接渲染进度条")
     is_executing: bool
     is_paused: bool
     pending_question: Optional[str]
