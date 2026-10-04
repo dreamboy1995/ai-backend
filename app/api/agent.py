@@ -26,11 +26,14 @@ from app.models.agent import (
     AgentStatusResponse,
     AskUserRespondRequest,
     AskUserRespondResponse,
+    END_REASON_CONFIRMING,
     END_REASON_IDLE,
     PlanPreviewItem,
     PlanRequest,
     PlanResponse,
     TERMINAL_END_REASONS,
+    ToolConfirmRequest,
+    ToolConfirmResponse,
 )
 from app.services.agent_session_store import get_agent_session_store
 from app.services.agent_state_machine import (
@@ -40,6 +43,7 @@ from app.services.agent_state_machine import (
 from app.services.planner import PlannerError, plan as planner_plan
 from app.services.react_loop import (
     handle_ask_user_response,
+    handle_tool_confirm,
     is_agent_running,
     resume_agent_loop,
     start_agent_loop,
@@ -158,6 +162,11 @@ async def get_status(session_id: str):
         done_steps=session.done_steps,
         end_reason=session.end_reason,
         end_message=session.end_message,
+        # S8 确认链路：前端 Builder 面板据此弹出「确认写入」浮层
+        pending_confirmation_id=session.pending_confirmation_id,
+        pending_confirmation_prompt=session.pending_confirmation_prompt,
+        pending_confirmation_preview=session.pending_confirmation_preview,
+        pending_confirmation_tool=session.pending_confirmation_tool,
     )
 
 
@@ -280,5 +289,47 @@ async def respond_to_ask_user(req: AskUserRespondRequest):
         raise HTTPException(
             status_code=500,
             detail="处理用户回复失败",
+        )
+
+
+@router.post("/confirm", response_model=ToolConfirmResponse)
+async def confirm_tool_execution(req: ToolConfirmRequest):
+    """
+    S8 确认链路：处理用户对工具执行的确认/拒绝。
+
+    当 Agent 执行 write_file / run_command / git_commit 等需要确认的工具时，
+    ReAct 循环暂停，将 confirmation_id 写入 AgentSession.pending_confirmation_id。
+    Builder 面板轮询 status 接口发现非空后弹出「确认写入」浮层，
+    用户点击「允许」或「拒绝」后调用本接口恢复执行。
+
+    执行流程（见 react_loop.handle_tool_confirm）：
+      1. 校验 confirmation_id 与会话一致（防止伪造请求）。
+      2. allow → 调用 tool_registry.confirm_tool 真正落盘；
+         deny → 直接标记步骤 failed。
+      3. 清除 pending_confirmation_* 字段，重启 ReAct 循环。
+    """
+    session = _get_session_or_404(req.session_id)
+
+    success, result_summary = await handle_tool_confirm(
+        session_id=req.session_id,
+        confirmation_id=req.confirmation_id,
+        action=req.action,
+    )
+
+    if success:
+        logger.info(
+            f"[Agent] 用户确认工具执行: session={req.session_id}, "
+            f"action={req.action}, confirmation_id={req.confirmation_id}"
+        )
+        action_label = "允许" if req.action == "allow" else "拒绝"
+        return ToolConfirmResponse(
+            success=True,
+            message=f"已{action_label}工具执行，Agent 继续运行",
+            result_summary=result_summary,
+        )
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=result_summary or "确认操作失败",
         )
 

@@ -275,15 +275,19 @@ def test_session_store_memory_fallback():
 # ============================================================
 
 def test_mock_tool_executor():
-    """Mock 工具执行器返回模拟成功消息"""
+    """Mock 工具执行器默认直接返回成功，不触发确认"""
     executor = MockToolExecutor()
 
-    obs = asyncio.run(executor.execute("write_file", {"path": "main.py"}))
-    assert "main.py" in obs
-    assert "模拟" in obs
+    result = asyncio.run(executor.execute("write_file", {"path": "main.py", "content": "x"}))
+    assert result.success is True
+    assert "main.py" in result.output
+    assert "写入成功" in result.output
+    # 默认 Mock 不卡确认
+    assert result.requires_confirmation is False
 
-    obs = asyncio.run(executor.execute("run_command", {"cmd": "ls"}))
-    assert "ls" in obs
+    result = asyncio.run(executor.execute("run_command", {"cmd": "ls"}))
+    assert "ls" in result.output
+    assert result.success is True
     print("✅ MockToolExecutor 验证通过")
 
 

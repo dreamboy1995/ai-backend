@@ -32,9 +32,14 @@ from fastapi.testclient import TestClient
 from app.auth import create_access_token
 from app.main import app
 from app.models.agent import END_REASON_ASK_USER, END_REASON_COMPLETED
+from app.models.tool import ToolResult
 from app.services.agent_session_store import get_agent_session_store
 from app.services.react_loop import run_agent
-from app.services.tool_executor import ToolExecutor, set_default_tool_executor
+from app.services.tool_executor import (
+    ToolExecutor,
+    get_default_tool_executor,
+    set_default_tool_executor,
+)
 
 
 # ============================================================
@@ -91,14 +96,27 @@ PLANNER_PLAN_JSON = json.dumps({
 # ============================================================
 
 class _FakeToolExecutor(ToolExecutor):
-    """测试用工具执行器：记录调用、返回硬编码 observation"""
+    """测试用工具执行器：记录调用、返回 ToolResult"""
 
-    def __init__(self):
+    def __init__(self, confirm_tools=None):
         self.calls = []
+        self._confirm_tools = confirm_tools or set()
 
-    async def execute(self, tool, params):
+    async def execute(self, tool, params, *, workspace_root="", session_id=""):
         self.calls.append((tool, params))
-        return f"[mock] {tool} 执行成功，params={params}"
+        import uuid
+        if tool in self._confirm_tools:
+            return ToolResult(
+                success=True,
+                output=f"[mock preview] {tool}",
+                requires_confirmation=True,
+                confirmation_prompt=f"即将执行 {tool}",
+                confirmation_id=str(uuid.uuid4()),
+            )
+        return ToolResult(
+            success=True,
+            output=f"[mock] {tool} 执行成功，params={params}",
+        )
 
 
 @pytest.fixture()
@@ -222,8 +240,11 @@ def test_builder_e2e_start_and_complete_all_steps(client, monkeypatch):
     # 2. mock ReAct 循环的 Reason 阶段：每步返回 write_file 调用
     #    ToolExecutor 用 _FakeToolExecutor 记录调用——通过 set_default_tool_executor
     #    注入到 react_loop 全局，让 run_agent 在 tool_executor=None 时拿到本测试的实例
+    #    用 monkeypatch.setattr 自动复原，防止污染后续测试
     fake_executor = _FakeToolExecutor()
-    set_default_tool_executor(fake_executor)
+    monkeypatch.setattr(
+        "app.services.tool_executor._default_executor", fake_executor
+    )
 
     async def _react_chat(messages, model, **kwargs):
         # 每步 Reason 都决定调用 write_file

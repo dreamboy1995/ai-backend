@@ -435,27 +435,31 @@ def test_audit_log_written(tmp_workspace, tmp_path):
 # ============================================================
 
 def test_mcp_executor_read_file(tmp_workspace):
-    """MCPToolExecutor 调用 read_file 返回文件内容"""
+    """MCPToolExecutor 调用 read_file 返回 ToolResult，output 包含文件内容"""
     test_file = Path(tmp_workspace) / "bridge.txt"
     test_file.write_text("bridge content", encoding="utf-8")
 
     executor = MCPToolExecutor(workspace_root=tmp_workspace, session_id="bridge-test")
-    obs = asyncio.run(executor.execute("read_file", {"file_path": "bridge.txt"}))
+    result = asyncio.run(executor.execute("read_file", {"file_path": "bridge.txt"}))
 
-    assert obs == "bridge content"
+    assert result.success is True
+    assert result.output == "bridge content"
 
 
-def test_mcp_executor_failed_raises(tmp_workspace):
-    """MCPToolExecutor 工具失败时抛出 ToolExecutionError"""
+def test_mcp_executor_failed_returns_false(tmp_workspace):
+    """MCPToolExecutor 工具失败时返回 ToolResult(success=False)，不再抛异常"""
     executor = MCPToolExecutor(workspace_root=tmp_workspace, session_id="bridge-test")
 
-    with pytest.raises(ToolExecutionError):
-        asyncio.run(executor.execute("read_file", {"file_path": "no.txt"}))
+    result = asyncio.run(executor.execute("read_file", {"file_path": "no.txt"}))
+    assert result.success is False
+    assert result.error is not None
 
 
 def test_mcp_executor_write_file_confirmation(tmp_workspace):
-    """MCPToolExecutor 对 write_file 返回确认提示"""
+    """MCPToolExecutor 对 write_file 返回 requires_confirmation=True"""
     executor = MCPToolExecutor(workspace_root=tmp_workspace, session_id="bridge-test")
-    obs = asyncio.run(executor.execute("write_file", {"file_path": "x.py", "content": "y"}))
+    result = asyncio.run(executor.execute("write_file", {"file_path": "x.py", "content": "y"}))
 
-    assert "需要用户确认" in obs
+    assert result.requires_confirmation is True
+    assert result.confirmation_prompt is not None
+    assert result.confirmation_id is not None

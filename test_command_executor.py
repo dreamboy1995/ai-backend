@@ -593,21 +593,22 @@ def test_execute_then_confirm_streams_output(tmp_workspace):
 # ============================================================
 
 def test_mcp_executor_interactive_returns_text_not_raises(tmp_workspace):
-    """MCPToolExecutor 对交互式命令返回提示文本而非抛异常"""
+    """MCPToolExecutor 对交互式命令返回 ToolResult(requires_interaction=True)"""
     executor = MCPToolExecutor(
         workspace_root=tmp_workspace, session_id="test-mcp-interact"
     )
-    obs = asyncio.run(executor.execute("run_command", {"cmd": "npm init"}))
+    result = asyncio.run(executor.execute("run_command", {"cmd": "npm init"}))
 
-    # 不应抛 ToolExecutionError，而是返回提示字符串
-    assert "需要交互式输入" in obs
-    assert "npm init" in obs or "真实终端" in obs
+    # 不应抛 ToolExecutionError，而是返回标记 requires_interaction=True
+    assert result.requires_interaction is True
+    assert "npm init" in (result.error or "") or "交互式" in (result.error or "")
 
 
 def test_mcp_executor_normal_command_still_confirms(tmp_workspace):
-    """MCPToolExecutor 对普通命令仍返回需要确认提示"""
+    """MCPToolExecutor 对普通命令仍返回 requires_confirmation=True"""
     executor = MCPToolExecutor(
         workspace_root=tmp_workspace, session_id="test-mcp-normal"
     )
-    obs = asyncio.run(executor.execute("run_command", {"cmd": "echo hi"}))
-    assert "需要用户确认" in obs
+    result = asyncio.run(executor.execute("run_command", {"cmd": "echo hi"}))
+    assert result.requires_confirmation is True
+    assert result.confirmation_prompt is not None

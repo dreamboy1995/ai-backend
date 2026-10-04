@@ -34,6 +34,7 @@ SUGGESTED_TOOLS = Literal["write_file", "run_command", "search_code", "ask_user"
 # idle: 刚创建，尚未开始执行
 # paused: 用户主动暂停（可恢复）
 # ask_user: 等待用户回答问题（可恢复）
+# confirming: 等待用户确认工具执行（可恢复，S8 确认链路）
 # completed: 所有步骤正常完成
 # max_iter: 达到最大迭代次数（终态，不可恢复）
 # timeout: 执行超时（终态，不可恢复）
@@ -41,6 +42,7 @@ SUGGESTED_TOOLS = Literal["write_file", "run_command", "search_code", "ask_user"
 END_REASON_IDLE = "idle"
 END_REASON_PAUSED = "paused"
 END_REASON_ASK_USER = "ask_user"
+END_REASON_CONFIRMING = "confirming"
 END_REASON_COMPLETED = "completed"
 END_REASON_MAX_ITER = "max_iter"
 END_REASON_TIMEOUT = "timeout"
@@ -48,8 +50,8 @@ END_REASON_ERROR = "error"
 
 # 终态原因：会话已死亡，不允许再次 start/resume/pause
 TERMINAL_END_REASONS = {END_REASON_COMPLETED, END_REASON_MAX_ITER, END_REASON_TIMEOUT, END_REASON_ERROR}
-# 可恢复原因：暂停/等待用户，允许 resume
-RESUMABLE_END_REASONS = {END_REASON_PAUSED, END_REASON_ASK_USER}
+# 可恢复原因：暂停/等待用户/等待确认，允许 resume
+RESUMABLE_END_REASONS = {END_REASON_PAUSED, END_REASON_ASK_USER, END_REASON_CONFIRMING}
 
 
 class TaskStep(BaseModel):
@@ -110,6 +112,21 @@ class AgentSession(BaseModel):
     is_executing: bool = Field(default=False, description="Agent 循环是否正在执行")
     interrupt_flag: bool = Field(default=False, description="中断标志，循环顶部检查")
     pending_question: Optional[str] = Field(default=None, description="待用户回答的问题（ask_user 工具）")
+    # S8 确认链路：write_file / run_command 等工具需要用户确认后再真正执行
+    # 当 react_loop 检测到 ToolResult.requires_confirmation=True 时，
+    # 暂停循环并填充以下字段，等待前端 Builder 面板弹确认浮层后回传 confirmation_id。
+    pending_confirmation_id: Optional[str] = Field(
+        default=None, description="工具确认凭证 ID（一次性，由 tool_registry 生成）"
+    )
+    pending_confirmation_prompt: Optional[str] = Field(
+        default=None, description="确认浮层展示给用户的提示文本"
+    )
+    pending_confirmation_preview: Optional[str] = Field(
+        default=None, description="确认前的预览内容（Diff / 命令 / 文件列表）"
+    )
+    pending_confirmation_tool: Optional[str] = Field(
+        default=None, description="待确认的工具名（write_file / run_command / git_commit）"
+    )
     # 会话结束原因与描述（持久化到 Redis，供前端判断会话是否已死亡）
     # 取值见 END_REASON_* 常量；None 表示运行中或未开始
     end_reason: Optional[str] = Field(default=None, description="会话结束原因")
@@ -178,6 +195,12 @@ class AgentStatusResponse(BaseModel):
     返回 AgentSession 完整状态，供 Builder 面板每秒轮询刷新。
     包含每一步的状态、观察结果，以及整体进度。
 
+    S8 确认链路新增字段：
+      - pending_confirmation_id / _prompt / _preview / _tool
+        当会话处于「等待用户确认工具执行」状态时非空，
+        Builder 面板据此弹出「确认写入」浮层，用户确认后
+        调用 /v1/agent/confirm 恢复执行。
+
     进度字段：
       - progress: 0.0 ~ 1.0 的小数进度
       - progress_percent: 0 ~ 100 的整数进度（Builder 面板直接使用，
@@ -199,6 +222,28 @@ class AgentStatusResponse(BaseModel):
     done_steps: int
     end_reason: Optional[str] = Field(default=None, description="会话结束原因，None 表示运行中或未开始")
     end_message: Optional[str] = Field(default=None, description="会话结束的详细描述")
+    # S8 确认链路：供前端 Builder 面板弹「确认写入」浮层
+    pending_confirmation_id: Optional[str] = Field(default=None, description="工具确认凭证 ID")
+    pending_confirmation_prompt: Optional[str] = Field(default=None, description="确认浮层提示文本")
+    pending_confirmation_preview: Optional[str] = Field(default=None, description="确认前预览（Diff/命令等）")
+    pending_confirmation_tool: Optional[str] = Field(default=None, description="待确认工具名")
+
+
+class ToolConfirmRequest(BaseModel):
+    """POST /v1/agent/confirm 请求体（Builder 面板弹确认浮层后回传）"""
+
+    session_id: str = Field(..., min_length=1)
+    confirmation_id: str = Field(..., min_length=1, description="从 status 接口拿到的 pending_confirmation_id")
+    action: Literal["allow", "deny"] = Field(..., description="allow=允许执行，deny=拒绝执行")
+
+
+class ToolConfirmResponse(BaseModel):
+    """POST /v1/agent/confirm 响应体"""
+
+    success: bool
+    message: str
+    # 可选：执行结果摘要（allow 时填充，便于前端展示执行结果）
+    result_summary: Optional[str] = Field(default=None, description="执行结果文本摘要")
 
 
 class AskUserRespondRequest(BaseModel):

@@ -37,6 +37,7 @@ from app.models.agent import (
     AgentSession,
     END_REASON_ASK_USER,
     END_REASON_COMPLETED,
+    END_REASON_CONFIRMING,
     END_REASON_ERROR,
     END_REASON_MAX_ITER,
     END_REASON_PAUSED,
@@ -44,6 +45,7 @@ from app.models.agent import (
     TaskStep,
     TERMINAL_END_REASONS,
 )
+from app.models.tool import ToolResult
 from app.services.agent_session_store import get_agent_session_store
 from app.services.agent_state_machine import AgentStateMachine
 from app.services.llm import AdapterError, chat_completion_text
@@ -562,7 +564,14 @@ async def run_agent(
             # ---- Act（行动）----
             logger.info(f"[ReAct] >> Act: step={step.id}, tool={tool}")
             try:
-                observation = await tool_executor.execute(tool, params)
+                # 将 workspace_root / session_id 传入 execute，
+                # 供 MCPToolExecutor 解析相对路径、写入审计日志
+                result: ToolResult = await tool_executor.execute(
+                    tool,
+                    params,
+                    workspace_root=session.workspace_root,
+                    session_id=session.session_id,
+                )
             except ToolExecutionError as e:
                 logger.error(f"[ReAct] 工具执行失败 step={step.id}: {e}")
                 sm.mark_failed(step.id, f"工具执行失败: {e}")
@@ -576,7 +585,43 @@ async def run_agent(
                 _save_preserving_flags(session, store)
                 continue
 
+            # ---- 确认检测（S8 确认链路）----
+            # 当 ToolResult.requires_confirmation=True 时，
+            # 暂停循环，把 confirmation_id / prompt / preview 写入会话，
+            # 由前端 Builder 面板弹出「确认写入」浮层，用户确认后通过
+            # /v1/agent/confirm 触发 handle_tool_confirm 恢复执行。
+            if result.requires_confirmation:
+                exit_reason = END_REASON_CONFIRMING
+                session.is_executing = False
+                session.is_paused = True
+                session.interrupt_flag = True
+                session.pending_confirmation_id = result.confirmation_id
+                session.pending_confirmation_prompt = result.confirmation_prompt
+                session.pending_confirmation_preview = result.output
+                session.pending_confirmation_tool = tool
+                end_message = (
+                    f"等待用户确认工具执行：{tool} - "
+                    f"{result.confirmation_prompt or '(无提示)'}"
+                )
+                store.save(session)  # 确认状态由循环自身设置，直接保存
+                logger.info(
+                    f"[ReAct] 步骤 {step.id} 需要用户确认，循环暂停: "
+                    f"tool={tool}, confirmation_id={result.confirmation_id}"
+                )
+                break  # 暂停循环，等待 /v1/agent/confirm 恢复
+
             # ---- Observe（观察）----
+            observation = result.output or f"工具 {tool} 执行成功"
+            if not result.success:
+                # 执行器返回 success=False（非确认、非交互、真实失败）
+                err_msg = result.error or "工具执行失败"
+                sm.mark_failed(step.id, err_msg)
+                _save_preserving_flags(session, store)
+                logger.warning(
+                    f"[ReAct] 工具执行失败 step={step.id}: {err_msg}"
+                )
+                continue
+
             sm.mark_done(step.id, observation)
             _save_preserving_flags(session, store)
             logger.info(
@@ -595,8 +640,8 @@ async def run_agent(
     finally:
         # 循环结束，根据退出原因更新控制标志
         session.is_executing = False
-        if exit_reason in (END_REASON_ASK_USER, END_REASON_PAUSED):
-            # ask_user 或用户主动暂停：保持暂停状态，等待 resume / ask/respond
+        if exit_reason in (END_REASON_ASK_USER, END_REASON_PAUSED, END_REASON_CONFIRMING):
+            # ask_user / 用户主动暂停 / 等待工具确认：保持暂停状态，等待 resume / ask/respond / confirm
             pass
         else:
             # completed / max_iter / timeout / error：清除暂停标志，进入终态
@@ -701,7 +746,11 @@ async def resume_agent_loop(
 # ask_user 人工介入：处理用户回复
 # ============================================================
 
-async def handle_ask_user_response(session_id: str, answer: str) -> bool:
+async def handle_ask_user_response(
+    session_id: str,
+    answer: str,
+    tool_executor: Optional[ToolExecutor] = None,
+) -> bool:
     """
     处理用户对 ask_user 问题的回复。
 
@@ -711,8 +760,9 @@ async def handle_ask_user_response(session_id: str, answer: str) -> bool:
       3. 清除 pending_question，恢复循环。
 
     Args:
-        session_id: 会话 ID
-        answer:     用户回答内容
+        session_id:    会话 ID
+        answer:        用户回答内容
+        tool_executor: 工具执行器（可选，恢复循环时传入；None 用全局默认）
 
     Returns:
         True 表示处理成功；False 表示会话不存在或无待回答问题。
@@ -754,4 +804,137 @@ async def handle_ask_user_response(session_id: str, answer: str) -> bool:
     session.end_message = None
     store.save(session)
 
-    return await start_agent_loop(session_id)
+    return await start_agent_loop(session_id, tool_executor)
+
+
+# ============================================================
+# S8 确认链路：处理用户对工具执行的确认
+# ============================================================
+
+async def handle_tool_confirm(
+    session_id: str,
+    confirmation_id: str,
+    action: str,
+    tool_executor: Optional[ToolExecutor] = None,
+) -> tuple[bool, Optional[str]]:
+    """
+    处理用户对工具执行的确认操作（S8 核心确认链路）。
+
+    流程：
+      1. 校验会话存在 + 有 pending_confirmation + confirmation_id 一致。
+      2. 调用 tool_registry.confirm_tool 真正执行（allow）或拒绝（deny）。
+         - MockToolExecutor 模式下无真实落盘，返回模拟结果。
+         - MCPToolExecutor 模式下从 PendingConfirmationStore 取出原始
+           ToolCall，调用对应的 _do_* handler。
+      3. 找到当前 running 步骤，根据执行结果标记 done / failed。
+      4. 清除 pending_confirmation_* 字段，恢复 ReAct 循环。
+
+    Args:
+        session_id:       会话 ID
+        confirmation_id: 从 status 接口拿到的确认凭证（一次性，幂等校验）
+        action:           'allow' 或 'deny'
+        tool_executor:    工具执行器（Mock 模式下用于生成模拟结果）；
+                          MCP 模式下 confirm_tool 已自行查 registry，无需 executor。
+
+    Returns:
+        (True, result_summary) 表示成功；(False, error_msg) 表示失败。
+    """
+    store = get_agent_session_store()
+    session = store.get(session_id)
+    if session is None:
+        return False, "会话不存在"
+    if not session.pending_confirmation_id:
+        logger.warning(
+            f"[ReAct] handle_tool_confirm: 会话 {session_id} 无待确认的工具"
+        )
+        return False, "当前会话没有待确认的工具操作"
+    if session.pending_confirmation_id != confirmation_id:
+        logger.warning(
+            f"[ReAct] handle_tool_confirm: confirmation_id 不匹配 "
+            f"(请求={confirmation_id}, 会话={session.pending_confirmation_id})"
+        )
+        return False, "确认凭证与会话不匹配"
+
+    # ---- 真正执行 / 拒绝 ----
+    tool_name = session.pending_confirmation_tool or "<unknown>"
+    if action == "deny":
+        result_summary = "用户拒绝执行该工具操作"
+        logger.info(
+            f"[ReAct] 用户拒绝工具执行: session={session_id}, tool={tool_name}"
+        )
+        observation = "[USER_DENIED] 用户拒绝执行该操作"
+        step_status = "failed"
+        err_msg = result_summary
+    else:
+        # allow：调用真实确认流程
+        # 优先走 tool_registry.confirm_tool（MCP 模式），
+        # 若 confirmation_id 未命中 registry（Mock 模式下 registry 没存），
+        # 则降级为模拟成功结果。
+        from app.services.tool_registry import confirm_tool as registry_confirm
+        registry_result = await registry_confirm(
+            confirmation_id=confirmation_id,
+            action="allow",
+            session_id=session_id,
+        )
+
+        if registry_result.success:
+            result_summary = registry_result.output or f"工具 {tool_name} 执行成功"
+            observation = result_summary
+            step_status = "done"
+        elif registry_result.error == "确认凭证不存在或已过期":
+            # 降级：Mock 模式下 registry 没存 confirmation_id，模拟成功
+            result_summary = (
+                f"[Mock] 工具 {tool_name} 确认后执行成功（模拟）"
+            )
+            observation = result_summary
+            step_status = "done"
+            logger.info(
+                f"[ReAct] 降级为 Mock 确认执行: tool={tool_name}, "
+                f"session={session_id}"
+            )
+        else:
+            # 其他真实失败
+            result_summary = registry_result.error or "工具执行失败"
+            logger.warning(
+                f"[ReAct] 工具确认后执行失败: session={session_id}, "
+                f"tool={tool_name}, err={result_summary}"
+            )
+            observation = f"[CONFIRM_FAILED] {result_summary}"
+            step_status = "failed"
+            err_msg = result_summary
+
+    # ---- 更新步骤状态 ----
+    sm = AgentStateMachine(session)
+    running_steps = [s for s in session.plan if s.status == "running"]
+    if running_steps:
+        target_step = running_steps[0]
+        if step_status == "done":
+            sm.mark_done(target_step.id, observation)
+        else:
+            sm.mark_failed(target_step.id, err_msg)
+        logger.info(
+            f"[ReAct] 步骤 {target_step.id} 因用户确认{action}而{step_status}: "
+            f"session={session_id}"
+        )
+    else:
+        logger.warning(
+            f"[ReAct] handle_tool_confirm: 会话 {session_id} "
+            f"无 running 步骤，跳过 mark_{step_status}"
+        )
+
+    # ---- 清除确认字段，恢复循环 ----
+    session.pending_confirmation_id = None
+    session.pending_confirmation_prompt = None
+    session.pending_confirmation_preview = None
+    session.pending_confirmation_tool = None
+    session.is_paused = False
+    session.interrupt_flag = False
+    session.is_executing = True
+    session.end_reason = None
+    session.end_message = None
+    store.save(session)
+
+    # 重启 ReAct 循环继续后续步骤
+    await start_agent_loop(session_id, tool_executor)
+
+    return True, result_summary

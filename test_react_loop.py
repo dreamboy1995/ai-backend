@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from app.models.agent import AgentSession, TaskStep
+from app.models.tool import ToolResult
 from app.services.agent_session_store import get_agent_session_store
 from app.services.agent_state_machine import AgentStateMachine
 from app.services.react_loop import (
@@ -39,15 +40,34 @@ from app.services.tool_executor import ToolExecutor
 # ============================================================
 
 class FakeToolExecutor(ToolExecutor):
-    """测试用工具执行器，记录调用并返回预设结果"""
+    """测试用工具执行器，记录调用并返回预设 ToolResult"""
 
-    def __init__(self, results=None):
+    def __init__(self, results=None, confirm_tools=None):
         self.calls = []
+        # results: {tool_name: ToolResult}  可选
         self._results = results or {}
+        # confirm_tools: 需要确认的工具集合（默认空，测试不卡确认）
+        self._confirm_tools = confirm_tools or set()
 
-    async def execute(self, tool, params):
+    async def execute(self, tool, params, *, workspace_root="", session_id=""):
         self.calls.append((tool, params))
-        return self._results.get(tool, f"{tool} 执行成功（测试模拟）")
+        if tool in self._results:
+            return self._results[tool]
+        # 默认返回成功的 ToolResult
+        import uuid
+        requires_confirm = tool in self._confirm_tools
+        if requires_confirm:
+            return ToolResult(
+                success=True,
+                output=f"[Mock Preview] {tool} preview",
+                requires_confirmation=True,
+                confirmation_prompt=f"即将执行 {tool}，是否继续？",
+                confirmation_id=str(uuid.uuid4()),
+            )
+        return ToolResult(
+            success=True,
+            output=f"{tool} 执行成功（测试模拟）",
+        )
 
 
 def _make_session(steps, goal="测试 ReAct 循环"):
@@ -243,8 +263,8 @@ async def test_ask_user_response_resumes_loop():
         session = store.get(session_id)
         assert session.pending_question is not None
 
-        # 用户回复，恢复循环
-        success = await handle_ask_user_response(session_id, "SQLite")
+        # 用户回复，恢复循环（需透传 executor，否则重启后走全局默认 Mock）
+        success = await handle_ask_user_response(session_id, "SQLite", tool_executor=executor)
         assert success is True
 
         # 等待后台循环完成
@@ -365,7 +385,7 @@ async def test_tool_execution_failure_marks_step_failed():
     from app.services.tool_executor import ToolExecutionError
 
     class FailingExecutor(ToolExecutor):
-        async def execute(self, tool, params):
+        async def execute(self, tool, params, *, workspace_root="", session_id=""):
             raise ToolExecutionError("模拟工具执行失败")
 
     steps = [

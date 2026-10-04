@@ -437,31 +437,47 @@ def test_risk_tool_executor_di():
     ToolExecutor 抽象基类支持依赖注入，注入自定义执行器后循环正常工作。
     S7 注入 MockToolExecutor，S8 只需替换为 MCPToolExecutor，上层代码无需修改。
     """
-    from app.services.tool_executor import MockToolExecutor, get_default_tool_executor
+    import uuid
+    from app.models.tool import ToolResult
+    from app.services.tool_executor import (
+        MockToolExecutor,
+        ToolExecutor,
+        get_default_tool_executor,
+        set_default_tool_executor,
+    )
 
-    # 默认执行器为 MockToolExecutor
-    default = get_default_tool_executor()
-    assert isinstance(default, MockToolExecutor)
+    # 保存旧的默认执行器，测试结束后复原
+    old_default = get_default_tool_executor()
+    try:
+        # 默认执行器为 MockToolExecutor（或之前测试注入的 Fake，跳过严格类型断言）
+        default = get_default_tool_executor()
+        assert isinstance(default, ToolExecutor)
 
-    # 自定义执行器（模拟 S8 的 MCPToolExecutor）
-    class CustomExecutor(ToolExecutor):
-        def __init__(self):
-            self.calls = []
+        # 自定义执行器（模拟 S8 的 MCPToolExecutor）
+        class CustomExecutor(ToolExecutor):
+            def __init__(self):
+                self.calls = []
 
-        async def execute(self, tool, params):
-            self.calls.append((tool, params))
-            return f"[CUSTOM] {tool} 执行成功"
+            async def execute(self, tool, params, *, workspace_root="", session_id=""):
+                self.calls.append((tool, params))
+                return ToolResult(
+                    success=True,
+                    output=f"[CUSTOM] {tool} 执行成功",
+                )
 
-    custom = CustomExecutor()
-    assert isinstance(custom, ToolExecutor)  # 鸭子类型兼容
+        custom = CustomExecutor()
+        assert isinstance(custom, ToolExecutor)  # 鸭子类型兼容
 
-    # 验证：自定义执行器可替换默认执行器
-    import asyncio
+        # 验证：自定义执行器可替换默认执行器
+        import asyncio
 
-    result = asyncio.run(custom.execute("write_file", {"path": "test.py"}))
-    assert "CUSTOM" in result
-    assert len(custom.calls) == 1
-    assert custom.calls[0][0] == "write_file"
+        result = asyncio.run(custom.execute("write_file", {"path": "test.py"}))
+        assert "CUSTOM" in result.output
+        assert len(custom.calls) == 1
+        assert custom.calls[0][0] == "write_file"
+
+    finally:
+        set_default_tool_executor(old_default)
 
     print("✅ 风险预警-工具DI：自定义 ToolExecutor 可注入验证通过")
 

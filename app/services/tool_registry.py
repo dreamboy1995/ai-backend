@@ -254,6 +254,7 @@ async def tool_read_file(
 
     arguments:
       - file_path:  文件相对路径（相对于 workspace_root），必填。
+                    兼容 LLM 可能返回的别名 'path'（ReAct prompt 里写的是 path）。
       - start_line: 起始行号（1-based，可选）。
       - end_line:   结束行号（1-based，闭区间，可选）。
 
@@ -261,7 +262,8 @@ async def tool_read_file(
       - 文件大小 > TOOL_READ_FILE_MAX_BYTES 时自动截断，
         返回前 HEAD_LINES 行 + 后 TAIL_LINES 行，并附带警告。
     """
-    file_path = arguments.get("file_path")
+    # 参数名兼容：LLM 可能返回 'path'（prompt 里写的），handler 期望 'file_path'
+    file_path = arguments.get("file_path") or arguments.get("path")
     if not file_path or not isinstance(file_path, str):
         return ToolResult(success=False, error="缺少必填参数 file_path")
 
@@ -344,7 +346,7 @@ async def tool_write_file(
         output 字段包含 Diff 预览（复用 diff_generator）。
       - 用户在插件端点击确认后，由 confirm_tool 调用 _do_write_file 真正落盘。
     """
-    file_path = arguments.get("file_path")
+    file_path = arguments.get("file_path") or arguments.get("path")
     content = arguments.get("content")
     mode = arguments.get("mode", "overwrite")
 
@@ -409,7 +411,7 @@ async def _do_write_file(
       - 虽然 content 已经在内存中（来自模型输出），但分块写入可减少
         单次 IO 压力，并在中途失败时保留已写入部分。
     """
-    file_path = arguments["file_path"]
+    file_path = arguments.get("file_path") or arguments.get("path")
     content = arguments["content"]
     mode = arguments.get("mode", "overwrite")
 
