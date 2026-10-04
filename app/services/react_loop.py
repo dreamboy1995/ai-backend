@@ -1,4 +1,4 @@
-"""
+﻿"""
 S7 第 67-68 天：ReAct 执行循环骨架
 
 这是 Agent 的"心脏"——它不停地在 思考（Reason）→ 行动（Act）→ 观察（Observe） 之间循环。
@@ -608,7 +608,11 @@ async def run_agent(
                 session.interrupt_flag = True
                 session.pending_confirmation_id = result.confirmation_id
                 session.pending_confirmation_prompt = result.confirmation_prompt
-                session.pending_confirmation_preview = result.output
+                # run_command 场景 output 已是纯 str；write_file / git_commit 是 dict → json.dumps
+                if isinstance(result.output, str):
+                    session.pending_confirmation_preview = result.output
+                else:
+                    session.pending_confirmation_preview = json.dumps(result.output, ensure_ascii=False)
                 session.pending_confirmation_tool = tool
                 end_message = (
                     f"等待用户确认工具执行：{tool} - "

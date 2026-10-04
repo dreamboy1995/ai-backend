@@ -1,4 +1,4 @@
-"""
+﻿"""
 S7 第 61-62 天：Agent 核心数据结构定义
 
 定义 Agent 状态机所需的 Pydantic 模型，以及 S7 新增接口的请求/响应 DTO。
@@ -124,8 +124,8 @@ class AgentSession(BaseModel):
     pending_confirmation_prompt: Optional[str] = Field(
         default=None, description="确认浮层展示给用户的提示文本"
     )
-    pending_confirmation_preview: Optional[Any] = Field(
-        default=None, description="确认前的预览内容（diff dict / git_changes dict / 命令文本）"
+    pending_confirmation_preview: Optional[str] = Field(
+        default=None, description="确认前的预览内容（JSON 字符串，结构化 dict / 纯文本命令行）"
     )
     pending_confirmation_tool: Optional[str] = Field(
         default=None, description="待确认的工具名（write_file / run_command / git_commit）"
@@ -235,7 +235,7 @@ class AgentStatusResponse(BaseModel):
     # S8 确认链路：供前端 Builder 面板弹「确认写入」浮层
     pending_confirmation_id: Optional[str] = Field(default=None, description="工具确认凭证 ID")
     pending_confirmation_prompt: Optional[str] = Field(default=None, description="确认浮层提示文本")
-    pending_confirmation_preview: Optional[Any] = Field(default=None, description="确认前预览（diff dict / git_changes dict / 命令文本）")
+    pending_confirmation_preview: Optional[str] = Field(default=None, description="确认前预览（JSON 字符串，结构化 dict / 纯文本命令行）")
     pending_confirmation_tool: Optional[str] = Field(default=None, description="待确认工具名")
     # S8 第 79-80 天：熔断状态（前端判断是否需要提示用户人工介入）
     consecutive_failures: int = Field(default=0, description="连续失败计数")
