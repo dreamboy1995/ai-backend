@@ -10,3 +10,4 @@ __pycache__/
 .ai_index/
 # S5 BM25 索引缓存（pickle 序列化文件）
 .ai_cache/
+.ai_planner_logs
