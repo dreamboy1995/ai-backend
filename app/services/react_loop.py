@@ -97,6 +97,16 @@ _REASON_SYSTEM_PROMPT_TEMPLATE = """你是一个专业的开发 Agent，正在�
 - search_code：搜索代码，参数 {{ "query": "搜索关键词" }}
 - ask_user：向用户提问（遇到关键决策时使用），参数 {{ "question": "要问用户的问题" }}
 
+**强制规则（必须遵守）**：
+1. 如果「建议工具」是 ask_user，**必须**返回 ask_user，把步骤描述中的决策点整理成一个清晰的问题向用户提问，**不得自行替用户做决定**。
+2. 即使「建议工具」不是 ask_user，但只要本步骤涉及技术选型 / 架构决策 / 外部依赖选择 / 配置参数，且存在两个及以上合理方案，也**必须**返回 ask_user。
+3. 只有在明确无选型空间的纯执行步骤，才返回 write_file / run_command / search_code。
+4. ask_user 的 question 应当给出可选方案供用户选择（例如："使用 SQLite 还是 PostgreSQL？"）。
+
+**示例**：
+- 步骤"选择数据库方案"，建议工具 ask_user → 返回 {{"tool": "ask_user", "params": {{"question": "使用 SQLite 还是 PostgreSQL？"}}}}
+- 步骤"实现后端 API"，建议工具 write_file，无选型 → 返回 {{"tool": "write_file", "params": {{"path": "...", "content": "..."}}}}
+
 只返回 JSON 对象本身。
 """
 

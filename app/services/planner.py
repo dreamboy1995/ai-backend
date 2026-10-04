@@ -73,6 +73,11 @@ _PLANNER_SYSTEM_PROMPT = """你是一个顶级的全栈项目架构师。用户�
 - dependencies: 依赖的前置步骤 ID 列表，无依赖则为空数组 []。只能引用前面已定义的步骤 id。
 - suggested_tool: 建议使用的工具，必须是以下之一："write_file" | "run_command" | "search_code" | "ask_user"。
 
+**suggested_tool 选择规则（关键）**：
+- 当本步骤涉及**技术选型 / 架构决策 / 外部依赖选择 / 配置参数**，且存在两个及以上合理方案时（例如"使用 SQLite 还是 PostgreSQL"、"用 Redis 还是内存缓存"、"UI 框架选 Ant Design 还是 Element Plus"），**必须**将 suggested_tool 设为 "ask_user"，让 Agent 在执行时先向用户确认，**不要替用户做决定**。
+- 纯执行类步骤（写代码、跑命令、搜索代码）按实际动作选择 write_file / run_command / search_code。
+- 同一计划中至少要有 1 个 ask_user 步骤（若需求本身完全无选型空间，可省略）。
+
 **拆解原则**：
 1. 步骤数严格控制在 5 到 10 步之间，不能多也不能少。
 2. 对于"从零生成项目"类型的需求，第一步必须是"初始化项目结构"（如创建目录、git init、初始化 package.json 等）。
@@ -86,10 +91,11 @@ _PLANNER_SYSTEM_PROMPT = """你是一个顶级的全栈项目架构师。用户�
 {
   "plan": [
     {"id":"step_1","description":"初始化项目结构","details":"创建 todo-app 目录，初始化前后端分离结构，执行 git init 和 npm init","dependencies":[],"suggested_tool":"run_command"},
-    {"id":"step_2","description":"设计数据库表","details":"设计 Todo 表的字段 (id, title, completed, created_at)，选择 SQLite 作为开发数据库","dependencies":["step_1"],"suggested_tool":"write_file"},
-    {"id":"step_3","description":"实现后端 API","details":"使用 Express.js 实现 Todo 的增删改查 RESTful 接口，连接 SQLite 数据库","dependencies":["step_2"],"suggested_tool":"write_file"},
-    {"id":"step_4","description":"搭建前端页面","details":"使用 React + Vite 搭建前端，实现 Todo 列表展示、新增、删除、勾选完成功能","dependencies":["step_1"],"suggested_tool":"write_file"},
-    {"id":"step_5","description":"联调与测试","details":"前后端联调，验证 Todo 的增删改查功能完整可用","dependencies":["step_3","step_4"],"suggested_tool":"run_command"}
+    {"id":"step_2","description":"选择数据库方案","details":"Todo 应用的数据存储方案：SQLite（轻量、零配置）还是 PostgreSQL（功能强、适合生产）？","dependencies":["step_1"],"suggested_tool":"ask_user"},
+    {"id":"step_3","description":"设计数据库表","details":"根据用户选定的数据库，设计 Todo 表的字段 (id, title, completed, created_at) 并创建 ORM 模型","dependencies":["step_2"],"suggested_tool":"write_file"},
+    {"id":"step_4","description":"实现后端 API","details":"使用 Express.js 实现 Todo 的增删改查 RESTful 接口，连接已选定的数据库","dependencies":["step_3"],"suggested_tool":"write_file"},
+    {"id":"step_5","description":"搭建前端页面","details":"使用 React + Vite 搭建前端，实现 Todo 列表展示、新增、删除、勾选完成功能","dependencies":["step_1"],"suggested_tool":"write_file"},
+    {"id":"step_6","description":"联调与测试","details":"前后端联调，验证 Todo 的增删改查功能完整可用","dependencies":["step_4","step_5"],"suggested_tool":"run_command"}
   ]
 }
 """
