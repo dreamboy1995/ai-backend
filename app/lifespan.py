@@ -5,6 +5,7 @@ from fastapi import FastAPI
 
 from app.config import settings
 from app.services.session import get_session_service
+from app.services.tool_executor import set_default_tool_executor, MCPToolExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,8 @@ async def _session_cleanup_loop():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting AI Backend application")
+    # S8: 将默认执行器从 Mock 切换为 MCP（含确认链路）
+    set_default_tool_executor(MCPToolExecutor())
     cleanup_task = asyncio.create_task(_session_cleanup_loop())
     try:
         yield
