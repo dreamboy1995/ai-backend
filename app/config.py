@@ -271,6 +271,27 @@ class Settings(BaseSettings):
     TOOL_COMMAND_DEFAULT_TIMEOUT: float = 60.0
     TOOL_COMMAND_MAX_TIMEOUT: float = 300.0
 
+    # S8 第 77-78 天：git_commit 自动生成 Commit Message
+    # 启用后，git_commit 未提供 message 时，后端调用 LLM 基于暂存区 Diff 生成
+    # 遵循 Conventional Commits 规范（feat: / fix: / refactor: / docs: ...）
+    GIT_COMMIT_AUTO_MESSAGE_ENABLED: bool = True
+    # 自动生成 message 使用的模型 ID
+    GIT_COMMIT_AUTO_MESSAGE_MODEL: str = "glm-4.5-air"
+    # 自动生成 message 的模型调用超时（秒）。Commit Message 生成很短，给 15s 足够
+    GIT_COMMIT_AUTO_MESSAGE_TIMEOUT_SECONDS: float = 15.0
+    # 自动生成 message 的采样温度（较低保证输出稳定）
+    GIT_COMMIT_AUTO_MESSAGE_TEMPERATURE: float = 0.2
+    # 自动生成 message 时传给 LLM 的最大 token（Commit Message 通常 < 200 tokens）
+    GIT_COMMIT_AUTO_MESSAGE_MAX_TOKENS: int = 200
+    # 传给 LLM 的 diff 最大字符数（超过则截断前 N 行 + 后 N 行，防止 Prompt 膨胀）
+    GIT_COMMIT_DIFF_MAX_CHARS: int = 8000
+    # 自动生成 message 失败时的降级模板（无法调用 LLM 或 LLM 输出为空时使用）
+    GIT_COMMIT_FALLBACK_MESSAGE: str = "chore: auto commit by agent"
+
+    # S8 第 77-78 天：审计日志增强
+    # 审计日志可选截断 ToolResult.output（避免大输出撑爆日志文件），0 表示不截断
+    TOOL_AUDIT_LOG_OUTPUT_MAX_CHARS: int = 500
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

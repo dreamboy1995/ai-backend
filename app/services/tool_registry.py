@@ -48,6 +48,157 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
+# S8 第 77-78 天：git_commit 自动生成 Commit Message（LLM 驱动）
+# ============================================================
+# 当用户未提供 commit message 时，基于 git diff（优先 staged，fallback 工作区）
+# 调用 LLM 按 Conventional Commits 规范生成 message。
+#
+# 设计要点：
+#   - 在 tool_git_commit（execute 阶段）尝试生成，让用户在确认框预览 AI 建议
+#   - LLM 调用失败（超时 / 限流 / 网络）时静默降级为 settings.GIT_COMMIT_FALLBACK_MESSAGE
+#   - diff 过长时截断（settings.GIT_COMMIT_DIFF_MAX_CHARS），避免 Prompt 膨胀
+#   - 异步安全：LLM 调用不阻塞工具注册中心的其他 handler
+
+_COMMIT_MESSAGE_SYSTEM_PROMPT = """你是一个专业的 Git Commit Message 生成器。
+请根据提供的 git diff 输出，生成一条符合 Conventional Commits 规范的 commit message。
+
+规范：
+- 格式：<type>(<scope>): <subject>
+- type 必须为以下之一：feat / fix / refactor / docs / style / test / chore / ci / build / perf
+- scope 可选，用括号括起相关模块名
+- subject 用简短的中文或英文描述变更内容，不超过 72 字符
+- 只输出 commit message 本身，不要任何解释、前后缀或 Markdown 格式
+
+示例：
+- feat(auth): 增加 OAuth2 登录支持
+- fix(api): 修复用户列表分页参数未传递的 bug
+- refactor(utils): 提取字符串工具函数到独立模块
+- docs: 更新 README 安装说明"""
+
+
+def _truncate_diff_for_llm(diff_text: str) -> str:
+    """
+    截断 git diff 以适配 LLM Prompt 大小限制。
+    超过 settings.GIT_COMMIT_DIFF_MAX_CHARS 时保留前 2/3 + 后 1/3。
+    """
+    max_chars = settings.GIT_COMMIT_DIFF_MAX_CHARS
+    if not diff_text or len(diff_text) <= max_chars:
+        return diff_text
+
+    # 前 2/3 + 后 1/3，中间插入截断标记
+    head_size = int(max_chars * 2 / 3)
+    tail_size = max_chars - head_size - 60  # 留空间给截断标记
+    if tail_size < 0:
+        tail_size = 0
+
+    return (
+        diff_text[:head_size]
+        + f"\n... [diff truncated: {len(diff_text) - max_chars} chars omitted] ...\n"
+        + diff_text[-tail_size:]
+    )
+
+
+async def _generate_commit_message_via_llm(diff_text: str) -> Optional[str]:
+    """
+    调用 LLM 基于 git diff 生成 commit message。
+
+    Returns:
+        生成的 commit message 字符串；LLM 不可用或输出无效时返回 None。
+    """
+    if not settings.GIT_COMMIT_AUTO_MESSAGE_ENABLED or not diff_text.strip():
+        return None
+
+    try:
+        from app.services.llm import (
+            AdapterError,
+            AdapterFactory,
+            chat_completion_text,
+        )
+
+        truncated_diff = _truncate_diff_for_llm(diff_text)
+        messages = [
+            {"role": "system", "content": _COMMIT_MESSAGE_SYSTEM_PROMPT},
+            {"role": "user", "content": f"以下是 git diff：\n\n```diff\n{truncated_diff}\n```"},
+        ]
+
+        raw = await chat_completion_text(
+            messages=messages,
+            model=settings.GIT_COMMIT_AUTO_MESSAGE_MODEL,
+            temperature=settings.GIT_COMMIT_AUTO_MESSAGE_TEMPERATURE,
+            timeout=settings.GIT_COMMIT_AUTO_MESSAGE_TIMEOUT_SECONDS,
+            max_tokens=settings.GIT_COMMIT_AUTO_MESSAGE_MAX_TOKENS,
+        )
+
+        # 清洗输出：去除可能的 ``` 包裹和多余空白
+        message = raw.strip()
+        if message.startswith("```"):
+            # 去掉开头的 ``` 或 ```text / ```bash 等标记
+            first_newline = message.find("\n")
+            if first_newline != -1:
+                message = message[first_newline + 1:]
+        if message.endswith("```"):
+            message = message[:-3]
+        message = message.strip()
+
+        # 取第一行（commit message 通常只需要第一行 subject）
+        first_line = message.split("\n", 1)[0].strip()
+
+        # 简单校验：Conventional Commits 格式正则
+        cc_pattern = r"^(feat|fix|refactor|docs|style|test|chore|ci|build|perf)(\([a-zA-Z0-9_\-/]+\))?:\s+.+"
+        if first_line and re.match(cc_pattern, first_line):
+            logger.info(f"[ToolRegistry] LLM 生成 commit message: {first_line}")
+            return first_line
+        elif first_line and len(first_line) <= 120:
+            # 格式不严格但看起来像一句话，作为 fallback 接受
+            logger.warning(
+                f"[ToolRegistry] LLM 输出不符合 Conventional Commits 格式，"
+                f"作为降级方案接受: {first_line}"
+            )
+            return first_line
+
+        logger.warning(
+            f"[ToolRegistry] LLM 生成的 commit message 无效: {raw[:100]}"
+        )
+        return None
+
+    except AdapterError as e:
+        logger.warning(f"[ToolRegistry] LLM 调用失败，降级为默认 message: {e}")
+        return None
+    except Exception as e:
+        logger.warning(f"[ToolRegistry] 自动生成 commit message 异常: {e}", exc_info=True)
+        return None
+
+
+async def _get_git_diff_for_commit(workspace_root: str) -> str:
+    """
+    获取用于生成 commit message 的 git diff。
+
+    优先级：
+      1. git diff --staged（已暂存的变更，最精确）
+      2. git diff（未暂存但已修改的文件）
+      3. git diff HEAD（兜底，包含所有差异）
+
+    返回 diff 文本；无变更或 git 不可用时返回空串。
+    """
+    # 1. staged diff
+    staged = await _run_git(["diff", "--staged"], workspace_root)
+    if staged.success and staged.output.strip():
+        return staged.output
+
+    # 2. 工作区 diff（untracked 文件不在 diff 里，但 status 已经确认有变更了）
+    unstaged = await _run_git(["diff"], workspace_root)
+    if unstaged.success and unstaged.output.strip():
+        return unstaged.output
+
+    # 3. 兜底：diff HEAD
+    head = await _run_git(["diff", "HEAD"], workspace_root)
+    if head.success and head.output.strip():
+        return head.output
+
+    return ""
+
+
+# ============================================================
 # 工具 handler 类型签名
 # ============================================================
 # 每个工具 handler 接收 (arguments, workspace_root, session_id)，
@@ -173,34 +324,72 @@ async def write_audit_log(
     session_id: str,
     tool_call: ToolCall,
     result: ToolResult,
+    duration_ms: float = 0.0,
 ) -> None:
     """
     异步写入审计日志（JSON Lines）。
 
     记录格式（每行一个 JSON）：
     {
-      "timestamp": "2026-10-04T10:00:00.000Z",
+      "timestamp": "2026-10-04T10:00:00.123Z",
       "session_id": "...",
       "tool_name": "read_file",
       "arguments": {"file_path": "main.py"},
       "success": true,
       "requires_confirmation": false,
-      "error": null
+      "duration_ms": 12.34,
+      "output_chars": 1024,
+      "output_preview": "...前 500 字符...",    // 可选，根据 TOOL_AUDIT_LOG_OUTPUT_MAX_CHARS
+      "error": null,
+      "has_confirmation_id": false
     }
 
-    注意：不记录 output（可能包含大段文件内容/命令输出），避免日志膨胀。
+    设计要点（S8 第 77-78 天："用于后续调试和 P4 的数据飞轮"）：
+      - arguments 完整记录（便于复现）
+      - output 仅记录字符数 + 可选截断预览（避免日志膨胀，大输出如 run_command 的
+        npm install 日志可达数十 MB，全量写日志会拖垮磁盘）
+      - duration_ms 记录执行耗时（毫秒级，便于定位慢工具）
+      - 用 time.strftime + utc 时间戳，保证跨时区一致性
+      - 审计日志写入失败不阻断工具执行（try/except 内部吞掉）
+
+    Args:
+        session_id:      会话 ID。
+        tool_call:       原始工具调用。
+        result:          工具执行结果。
+        duration_ms:     工具执行耗时（毫秒）。0 表示未统计（兼容旧调用）。
     """
     try:
         _ensure_audit_dir()
+
+        # output 预览：可选截断（S8 风险预警：大输出撑爆日志）
+        output_chars = len(result.output) if result.output else 0
+        max_preview = settings.TOOL_AUDIT_LOG_OUTPUT_MAX_CHARS
+        output_preview = None
+        if result.output and max_preview > 0 and output_chars > 0:
+            if output_chars <= max_preview:
+                output_preview = result.output
+            else:
+                output_preview = (
+                    result.output[:max_preview]
+                    + f"\n... [truncated, total {output_chars} chars] ..."
+                )
+
         entry = {
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+            "timestamp": time.strftime(
+                "%Y-%m-%dT%H:%M:%S.") + f"{int((time.time() % 1) * 1000):03d}Z",
             "session_id": session_id,
             "tool_name": tool_call.tool_name,
             "arguments": tool_call.arguments,
             "success": result.success,
             "requires_confirmation": result.requires_confirmation,
+            "duration_ms": round(duration_ms, 2),
+            "output_chars": output_chars,
             "error": result.error,
+            "has_confirmation_id": result.confirmation_id is not None,
         }
+        if output_preview is not None:
+            entry["output_preview"] = output_preview
+
         async with _audit_lock:
             with open(settings.TOOL_AUDIT_LOG_PATH, "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -812,12 +1001,19 @@ async def tool_git_commit(
     git_commit：Git 提交（需用户确认）。
 
     arguments:
-      - message: 提交信息（可选，未提供时返回提示需要确认后再决定）。
+      - message: 提交信息（可选）。未提供时自动调用 LLM 基于暂存区 Diff 生成。
 
     安全机制（S8 第 77-78 天）：
-      - 提交前先执行 git status，若工作区无变更则直接返回失败。
-      - 返回 requires_confirmation=True，output 包含变更文件列表，
+      - 提交前先执行 git status，若工作区无变更则直接返回失败，不执行空提交。
+      - 未提供 message 时，调用 LLM 自动生成（基于 git diff，遵循 Conventional Commits）。
+        LLM 不可用时降级为 settings.GIT_COMMIT_FALLBACK_MESSAGE。
+      - 返回 requires_confirmation=True，output 包含变更文件列表 + AI 建议的 message，
         用户确认后由 confirm_tool 调用 _do_git_commit 执行。
+
+    风险预警应对：
+      - LLM 调用有独立超时（GIT_COMMIT_AUTO_MESSAGE_TIMEOUT_SECONDS），不阻塞主流程。
+      - diff 过长时截断（_truncate_diff_for_llm），避免 Prompt 膨胀。
+      - 所有异常降级：LLM 失败不影响 git_commit 主流程，用 fallback message 继续。
     """
     # 先检查 git 状态
     status_result = await _run_git(["status", "--short"], workspace_root)
@@ -831,30 +1027,66 @@ async def tool_git_commit(
     if not status_output:
         return ToolResult(success=False, error="工作区无变更，无需提交")
 
-    message = arguments.get("message", "")
-    if not message:
-        message = "(未提供提交信息，确认后可补充)"
+    message = arguments.get("message", "").strip()
 
+    # 未提供 message → 尝试自动生成（S8 第 77-78 天核心功能）
+    auto_generated = False
+    if not message:
+        message, auto_generated = await _try_auto_generate_message(
+            workspace_root, session_id
+        )
+
+    # 更新 arguments 确保 message 字段完整（供后续 confirm_tool 使用）
+    arguments["message"] = message
+
+    # 构造确认提示
+    ai_hint = "（AI 自动生成）" if auto_generated else ""
     prompt = (
-        f"即将执行 git commit，提交信息：\n{message}\n\n"
+        f"即将执行 git commit，提交信息{ai_hint}：\n{message}\n\n"
         f"涉及变更文件：\n{status_output}\n\n是否继续？"
     )
 
+    output = f"[变更文件]\n{status_output}\n\n[Commit Message{ai_hint}]\n{message}"
+
     return ToolResult(
         success=True,
-        output=status_output,
+        output=output,
         requires_confirmation=True,
         confirmation_prompt=prompt,
     )
+
+
+async def _try_auto_generate_message(
+    workspace_root: str, session_id: str
+) -> Tuple[str, bool]:
+    """
+    尝试自动生成 commit message。
+
+    Returns:
+        (message, auto_generated_flag): message 为最终要用的 commit message，
+        auto_generated_flag=True 表示是 LLM 生成的，False 表示降级为 fallback。
+    """
+    diff_text = await _get_git_diff_for_commit(workspace_root)
+
+    llm_generated = await _generate_commit_message_via_llm(diff_text)
+    if llm_generated:
+        return llm_generated, True
+
+    # LLM 不可用 / 失败 → 使用 fallback
+    fallback = settings.GIT_COMMIT_FALLBACK_MESSAGE
+    logger.info(
+        f"[ToolRegistry] 使用 fallback commit message: {fallback}, session={session_id}"
+    )
+    return fallback, False
 
 
 async def _do_git_commit(
     arguments: Dict[str, Any], workspace_root: str, session_id: str
 ) -> ToolResult:
     """git_commit 的真正执行逻辑（用户确认后调用）。"""
-    message = arguments.get("message", "")
+    message = arguments.get("message", "").strip()
     if not message:
-        message = "chore: auto commit by agent"
+        message = settings.GIT_COMMIT_FALLBACK_MESSAGE
 
     # git add -A
     add_result = await _run_git(["add", "-A"], workspace_root)
@@ -953,7 +1185,7 @@ async def execute_tool(
       3. 若 handler 返回 requires_confirmation=True：
          - 生成 confirmation_id，存入 PendingConfirmationStore。
          - 将 confirmation_id 填入 ToolResult 返回。
-      4. 无论成功失败，写入审计日志。
+      4. 无论成功失败，写入审计日志（含执行耗时 duration_ms）。
 
     Args:
         tool_call:       工具调用请求。
@@ -969,9 +1201,10 @@ async def execute_tool(
             success=False,
             error=f"未知工具: {tool_call.tool_name}，可用工具: {get_registered_tools()}",
         )
-        await write_audit_log(session_id, tool_call, result)
+        await write_audit_log(session_id, tool_call, result, duration_ms=0.0)
         return result
 
+    start = time.perf_counter()
     try:
         result = await handler(tool_call.arguments, workspace_root, session_id)
     except Exception as e:
@@ -985,6 +1218,7 @@ async def execute_tool(
             success=False,
             error=f"工具执行异常: {type(e).__name__}: {e}",
         )
+    duration_ms = (time.perf_counter() - start) * 1000
 
     # 需要用户确认：生成 confirmation_id
     if result.requires_confirmation and not result.confirmation_id:
@@ -993,7 +1227,7 @@ async def execute_tool(
         )
         result.confirmation_id = confirmation_id
 
-    await write_audit_log(session_id, tool_call, result)
+    await write_audit_log(session_id, tool_call, result, duration_ms=duration_ms)
     return result
 
 
@@ -1047,7 +1281,7 @@ async def confirm_tool(
             success=False,
             error="用户拒绝执行该操作",
         )
-        await write_audit_log(record.session_id, record.tool_call, result)
+        await write_audit_log(record.session_id, record.tool_call, result, duration_ms=0.0)
         return result
 
     # allow：调用真正的执行 handler
@@ -1057,9 +1291,10 @@ async def confirm_tool(
             success=False,
             error=f"工具 {record.tool_call.tool_name} 无需确认或不支持确认执行",
         )
-        await write_audit_log(record.session_id, record.tool_call, result)
+        await write_audit_log(record.session_id, record.tool_call, result, duration_ms=0.0)
         return result
 
+    start = time.perf_counter()
     try:
         result = await confirm_handler(
             record.tool_call.arguments,
@@ -1076,6 +1311,7 @@ async def confirm_tool(
             success=False,
             error=f"执行异常: {type(e).__name__}: {e}",
         )
+    duration_ms = (time.perf_counter() - start) * 1000
 
-    await write_audit_log(record.session_id, record.tool_call, result)
+    await write_audit_log(record.session_id, record.tool_call, result, duration_ms=duration_ms)
     return result
