@@ -554,13 +554,18 @@ async def tool_grep_search(
     grep_search：正则搜索代码。
 
     arguments:
-      - pattern:  正则模式，必填。
-      - path:     搜索目录（相对 workspace_root，默认 "."）。
-      - max_results: 最大结果数（默认 100）。
+      - pattern:       正则模式，必填。
+      - path:          搜索目录（相对 workspace_root，默认 "."）。
+      - max_results:   最大结果数（默认 100）。
+      - context_lines: 每个匹配行前后展示的上下文行数（默认 2，最大 10）。
 
     实现策略（S8 第 73-74 天）：
       - 优先使用 ripgrep（rg），若未安装则降级为 Python re + os.walk。
+      - 返回匹配的「文件路径 + 行号 + 上下文行」，格式遵循 ripgrep 约定：
+        匹配行用 `path:lineno:content`，上下文行用 `path:lineno-content`，
+        不同匹配组之间用 `--` 分隔。
       - 设置超时 TOOL_GREP_TIMEOUT_SECONDS，防止在 node_modules 中卡死。
+      - 自动跳过 node_modules / .git / __pycache__ 等大型依赖目录。
     """
     pattern = arguments.get("pattern")
     if not pattern or not isinstance(pattern, str):
@@ -568,6 +573,9 @@ async def tool_grep_search(
 
     search_path = arguments.get("path", ".")
     max_results = int(arguments.get("max_results", 100))
+    context_lines = int(arguments.get("context_lines", 2))
+    # 限制上下文行数上限，避免输出膨胀
+    context_lines = max(0, min(context_lines, 10))
 
     full_search_path = _resolve_safe_path(search_path, workspace_root)
     if full_search_path is None:
@@ -578,8 +586,11 @@ async def tool_grep_search(
     # 优先尝试 ripgrep
     rg_available = shutil_which("rg") is not None
     if rg_available:
+        # 计算相对于 workspace_root 的搜索路径，使 ripgrep 输出相对路径
+        # （与 Python 降级模式的 os.path.relpath 输出保持一致）
+        rel_search = os.path.relpath(str(full_search_path), workspace_root) if workspace_root else str(full_search_path)
         result = await _grep_with_ripgrep(
-            pattern, str(full_search_path), max_results, workspace_root
+            pattern, rel_search, max_results, context_lines, workspace_root
         )
         if result is not None:
             return result
@@ -587,7 +598,7 @@ async def tool_grep_search(
         logger.info("[ToolRegistry] ripgrep 执行失败，降级到 Python 正则搜索")
 
     return await _grep_with_python(
-        pattern, str(full_search_path), max_results, workspace_root
+        pattern, str(full_search_path), max_results, context_lines, workspace_root
     )
 
 
@@ -598,36 +609,92 @@ def shutil_which(cmd: str) -> Optional[str]:
 
 
 async def _grep_with_ripgrep(
-    pattern: str, search_path: str, max_results: int, workspace_root: str
+    pattern: str, search_path: str, max_results: int, context_lines: int,
+    workspace_root: str,
 ) -> Optional[ToolResult]:
-    """使用 ripgrep 搜索。返回 ToolResult 或 None（失败时降级）。"""
+    """
+    使用 ripgrep 搜索。返回 ToolResult 或 None（失败时降级）。
+
+    - 使用 `-C {context_lines}` 输出匹配行前后的上下文行。
+    - 使用 `--glob '!**/node_modules/**'` 等跳过大型依赖目录，
+      防止在 node_modules 中卡死（S8 风险预警）。
+    - 使用列表参数模式（create_subprocess_exec），杜绝命令注入。
+    """
+    # 跳过的大型目录 glob 模式（与 Python 降级实现的 skip_dirs 保持一致）
+    skip_globs = [
+        "!**/node_modules/**",
+        "!**/.git/**",
+        "!**/__pycache__/**",
+        "!**/.ai_index/**",
+        "!**/.ai_cache/**",
+    ]
+
+    args = [
+        "rg",
+        "--line-number",
+        "--no-heading",
+        "--color", "never",
+        "--max-count", str(max_results),
+    ]
+    if context_lines > 0:
+        args += ["-C", str(context_lines)]
+    for g in skip_globs:
+        args += ["--glob", g]
+    args += [pattern, search_path]
+
     try:
         proc = await asyncio.create_subprocess_exec(
-            "rg",
-            "--line-number",
-            "--no-heading",
-            "--color", "never",
-            "--max-count", str(max_results),
-            pattern,
-            search_path,
+            *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            cwd=workspace_root or None,
         )
         stdout, stderr = await asyncio.wait_for(
             proc.communicate(), timeout=settings.TOOL_GREP_TIMEOUT_SECONDS
         )
         if proc.returncode in (0, 1):  # 0=有匹配, 1=无匹配
-            output = stdout.decode("utf-8", errors="replace")
+            raw_output = stdout.decode("utf-8", errors="replace")
+            # 路径归一化：ripgrep 在 Windows 上输出反斜杠，且搜索 "." 时前缀 ".\"
+            # 统一为正斜杠并去除 "./" 前缀，与 Python 降级模式输出保持一致
+            output = _normalize_ripgrep_paths(raw_output)
             return ToolResult(success=True, output=output)
         return None
     except (asyncio.TimeoutError, OSError):
         return None
 
 
+def _normalize_ripgrep_paths(output: str) -> str:
+    """
+    归一化 ripgrep 输出中的路径分隔符与前缀。
+
+    ripgrep 在 Windows 上使用反斜杠，且当搜索路径为 "." 时会输出 ".\\" 前缀。
+    统一转换为正斜杠并去除 "./" 前缀，使插件端解析逻辑与 Python 降级模式一致。
+    """
+    if not output:
+        return output
+    normalized_lines = []
+    for line in output.splitlines():
+        # 替换反斜杠为正斜杠
+        line = line.replace("\\", "/")
+        # 去除行首的 "./" 前缀（ripgrep 搜索 "." 目录时产生）
+        if line.startswith("./"):
+            line = line[2:]
+        normalized_lines.append(line)
+    return "\n".join(normalized_lines)
+
+
 async def _grep_with_python(
-    pattern: str, search_path: str, max_results: int, workspace_root: str
+    pattern: str, search_path: str, max_results: int, context_lines: int,
+    workspace_root: str,
 ) -> ToolResult:
-    """Python 降级实现：re + os.walk，带超时保护。"""
+    """
+    Python 降级实现：re + os.walk，带超时保护。
+
+    输出格式遵循 ripgrep 约定（便于插件端统一解析）：
+      - 匹配行：  `path:lineno:content`
+      - 上下文行：`path:lineno-content`
+      - 不同匹配组之间用 `--` 分隔
+    """
     try:
         regex = re.compile(pattern)
     except re.error as e:
@@ -636,26 +703,70 @@ async def _grep_with_python(
     results: list[str] = []
     skip_dirs = {".git", "node_modules", "__pycache__", ".ai_index", ".ai_cache"}
 
+    match_count = 0
+
+    def _process_file(fpath: str) -> bool:
+        """
+        处理单个文件，将匹配结果（含上下文行）追加到 results。
+        返回 True 表示已达到 max_results，调用方应停止遍历。
+        """
+        nonlocal match_count
+        try:
+            with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+        except OSError:
+            return False
+
+        total = len(lines)
+        # 找出所有匹配行号
+        match_line_nos: set[int] = set()
+        for idx, line in enumerate(lines):
+            if regex.search(line):
+                match_line_nos.add(idx)  # 0-based
+                match_count += 1
+                if match_count >= max_results:
+                    break
+
+        if not match_line_nos:
+            return False
+
+        rel = os.path.relpath(fpath, workspace_root).replace("\\", "/")
+
+        # 合并重叠的上下文区间
+        # 每个匹配行 i 的上下文区间为 [i - ctx, i + ctx]
+        ranges: list[tuple[int, int]] = []
+        for ln in sorted(match_line_nos):
+            start = max(0, ln - context_lines)
+            end = min(total - 1, ln + context_lines)
+            if ranges and start <= ranges[-1][1] + 1:
+                # 与上一区间重叠或相邻，合并
+                ranges[-1] = (ranges[-1][0], max(ranges[-1][1], end))
+            else:
+                ranges.append((start, end))
+
+        # 按区间输出
+        # 格式遵循 ripgrep 约定：
+        #   匹配行：  path:lineno:content
+        #   上下文行：path-lineno-content
+        for r_idx, (start, end) in enumerate(ranges):
+            if r_idx > 0:
+                results.append("--")
+            for idx in range(start, end + 1):
+                if idx in match_line_nos:
+                    results.append(f"{rel}:{idx + 1}:{lines[idx].rstrip()}")
+                else:
+                    results.append(f"{rel}-{idx + 1}-{lines[idx].rstrip()}")
+
+        return match_count >= max_results
+
     async def _search():
-        count = 0
         for root, dirs, files in os.walk(search_path):
             # 跳过大型依赖目录
             dirs[:] = [d for d in dirs if d not in skip_dirs]
             for fname in files:
-                if count >= max_results:
-                    return
                 fpath = os.path.join(root, fname)
-                try:
-                    with open(fpath, "r", encoding="utf-8", errors="replace") as f:
-                        for lineno, line in enumerate(f, 1):
-                            if regex.search(line):
-                                rel = os.path.relpath(fpath, workspace_root)
-                                results.append(f"{rel}:{lineno}:{line.rstrip()}")
-                                count += 1
-                                if count >= max_results:
-                                    return
-                except OSError:
-                    continue
+                if _process_file(fpath):
+                    return
 
     try:
         await asyncio.wait_for(_search(), timeout=settings.TOOL_GREP_TIMEOUT_SECONDS)

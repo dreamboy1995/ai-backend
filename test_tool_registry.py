@@ -289,6 +289,111 @@ def test_execute_grep_search_finds_matches(tmp_workspace):
     assert "def foo" in result.output
 
 
+def test_grep_search_context_lines_format(tmp_workspace):
+    """grep_search 上下文行输出格式：匹配行用 :，上下文行用 -"""
+    content = "\n".join([
+        "line 1",
+        "line 2",
+        "def foo():",
+        "    pass",
+        "line 5",
+        "line 6",
+    ]) + "\n"
+    (Path(tmp_workspace) / "ctx.py").write_text(content, encoding="utf-8")
+
+    tool_call = _make_tool_call(
+        "grep_search", pattern="def foo", context_lines=1
+    )
+    result = asyncio.run(execute_tool(tool_call, tmp_workspace, "test-session"))
+
+    assert result.success is True
+    lines = result.output.splitlines()
+    # 匹配行（第3行）用冒号分隔：path:lineno:content
+    match_line = next(l for l in lines if "def foo" in l)
+    assert "ctx.py:3:def foo" in match_line
+    # 上下文行用减号分隔：path-lineno-content
+    context_lines = [l for l in lines if l.startswith("ctx.py-")]
+    assert any("ctx.py-2-line 2" in l for l in context_lines)
+    assert any("ctx.py-4-    pass" in l for l in context_lines)
+
+
+def test_grep_search_zero_context_lines(tmp_workspace):
+    """context_lines=0 时只返回匹配行，无上下文"""
+    content = "\n".join(["a", "b", "TARGET", "c", "d"]) + "\n"
+    (Path(tmp_workspace) / "zero.py").write_text(content, encoding="utf-8")
+
+    tool_call = _make_tool_call(
+        "grep_search", pattern="TARGET", context_lines=0
+    )
+    result = asyncio.run(execute_tool(tool_call, tmp_workspace, "test-session"))
+
+    assert result.success is True
+    lines = result.output.splitlines()
+    assert len(lines) == 1
+    assert "zero.py:3:TARGET" in lines[0]
+
+
+def test_grep_search_skip_node_modules(tmp_workspace):
+    """grep_search 跳过 node_modules 等大型依赖目录"""
+    # 在 node_modules 中放置匹配内容
+    nm_dir = Path(tmp_workspace) / "node_modules" / "pkg"
+    nm_dir.mkdir(parents=True)
+    (nm_dir / "index.js").write_text("const SECRET = 1;\n", encoding="utf-8")
+    # 在正常目录中放置匹配内容
+    (Path(tmp_workspace) / "main.js").write_text("const SECRET = 2;\n", encoding="utf-8")
+
+    tool_call = _make_tool_call("grep_search", pattern="SECRET")
+    result = asyncio.run(execute_tool(tool_call, tmp_workspace, "test-session"))
+
+    assert result.success is True
+    # node_modules 中的内容不应出现
+    assert "node_modules" not in result.output
+    # 正常目录中的内容应出现
+    assert "main.js" in result.output
+
+
+def test_grep_search_max_results_limit(tmp_workspace):
+    """grep_search 受 max_results 限制"""
+    lines = [f"item {i}\n" for i in range(50)]
+    (Path(tmp_workspace) / "many.py").write_text("".join(lines), encoding="utf-8")
+
+    tool_call = _make_tool_call(
+        "grep_search", pattern="item", max_results=3, context_lines=0
+    )
+    result = asyncio.run(execute_tool(tool_call, tmp_workspace, "test-session"))
+
+    assert result.success is True
+    # context_lines=0 时，每个匹配一行，最多 3 行
+    assert len(result.output.splitlines()) <= 3
+
+
+def test_grep_search_context_lines_clamped(tmp_workspace):
+    """context_lines 超过上限 10 时被截断为 10"""
+    content = "\n".join([f"L{i}" for i in range(30)]) + "\n"
+    (Path(tmp_workspace) / "clamp.py").write_text(content, encoding="utf-8")
+
+    tool_call = _make_tool_call(
+        "grep_search", pattern="L15", context_lines=999
+    )
+    result = asyncio.run(execute_tool(tool_call, tmp_workspace, "test-session"))
+
+    assert result.success is True
+    # 匹配行 L15（第16行）+ 前后各10行上下文 = 最多21行
+    lines = result.output.splitlines()
+    assert len(lines) <= 21
+
+
+def test_grep_search_invalid_regex(tmp_workspace):
+    """grep_search 无效正则表达式返回错误"""
+    (Path(tmp_workspace) / "x.py").write_text("hello\n", encoding="utf-8")
+
+    tool_call = _make_tool_call("grep_search", pattern="[invalid")
+    result = asyncio.run(execute_tool(tool_call, tmp_workspace, "test-session"))
+
+    assert result.success is False
+    assert "无效" in result.error or "正则" in result.error
+
+
 # ============================================================
 # git_commit 测试（无变更时返回错误）
 # ============================================================
