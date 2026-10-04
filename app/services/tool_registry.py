@@ -361,16 +361,25 @@ async def write_audit_log(
     try:
         _ensure_audit_dir()
 
-        # output 预览：可选截断（S8 风险预警：大输出撑爆日志）
-        output_chars = len(result.output) if result.output else 0
+        # output 预览：统一转 str 后再做 len / 切片（兼容 dict 类型 output）
+        # dict（结构化预览）→ json.dumps；str（普通文本）→ 原样
+        output_for_log: str
+        if isinstance(result.output, str):
+            output_for_log = result.output
+        elif isinstance(result.output, (dict, list)):
+            output_for_log = json.dumps(result.output, ensure_ascii=False)
+        else:
+            output_for_log = str(result.output) if result.output else ""
+
+        output_chars = len(output_for_log)
         max_preview = settings.TOOL_AUDIT_LOG_OUTPUT_MAX_CHARS
         output_preview = None
-        if result.output and max_preview > 0 and output_chars > 0:
+        if output_for_log and max_preview > 0 and output_chars > 0:
             if output_chars <= max_preview:
-                output_preview = result.output
+                output_preview = output_for_log
             else:
                 output_preview = (
-                    result.output[:max_preview]
+                    output_for_log[:max_preview]
                     + f"\n... [truncated, total {output_chars} chars] ..."
                 )
 
@@ -401,6 +410,26 @@ async def write_audit_log(
 # ============================================================
 # 路径安全工具
 # ============================================================
+
+# ============================================================
+# S8 第 79-80 天：沙箱编排器接入辅助
+# ============================================================
+# 所有文件读写、子进程执行统一走 SandboxOrchestrator：
+#   - HostSandbox：no-op 透传（宿主直接执行）
+#   - DockerSandbox：路径转 /workspace/xxx，命令走 docker exec
+
+async def _get_sandbox_orchestrator():
+    """Lazy 获取 SandboxOrchestrator（单例模式，首次调用才初始化）"""
+    from app.services.sandbox_orchestrator import get_sandbox_manager
+    manager = get_sandbox_manager()
+    return await manager.orchestrator()
+
+
+async def _to_sandbox_path(host_path: str) -> str:
+    """将宿主路径转换为沙箱内路径（Host 模式原样返回，Docker 模式 → /workspace/xxx）"""
+    orch = await _get_sandbox_orchestrator()
+    return await orch.resolve_path(host_path)
+
 
 def _resolve_safe_path(file_path: str, workspace_root: str) -> Optional[Path]:
     """
@@ -467,8 +496,10 @@ async def tool_read_file(
 
     # 大文件截断保护
     file_size = full_path.stat().st_size
+    # S8 第 79-80 天：Docker 模式下宿主路径 → /workspace/xxx
+    sandbox_path = await _to_sandbox_path(str(full_path))
     try:
-        with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+        with open(sandbox_path, "r", encoding="utf-8", errors="replace") as f:
             if file_size > settings.TOOL_READ_FILE_MAX_BYTES:
                 # 大文件：只读前 HEAD_LINES + 后 TAIL_LINES 行
                 head_lines: list[str] = []
@@ -550,7 +581,7 @@ async def tool_write_file(
     if full_path is None:
         return ToolResult(success=False, error=f"文件路径非法或逃逸出工作区: {file_path}")
 
-    # 读取原文件内容，生成 Diff 预览
+    # 读取原文件内容，生成结构化 Diff 预览
     try:
         from app.services.diff_generator import (
             generate_unified_diff,
@@ -559,7 +590,9 @@ async def tool_write_file(
 
         old_content = ""
         if full_path.exists() and full_path.is_file():
-            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+            # S8 第 79-80 天：Docker 模式下从沙箱读取原文件内容
+            sandbox_old_path = await _to_sandbox_path(str(full_path))
+            with open(sandbox_old_path, "r", encoding="utf-8", errors="replace") as f:
                 old_content = f.read()
 
         if mode == "append":
@@ -575,15 +608,33 @@ async def tool_write_file(
         )
     except Exception as e:
         logger.warning(f"[ToolRegistry] write_file Diff 生成失败，降级为无预览: {e}")
+        old_content = ""
+        new_content = content
         diff_text = ""
 
-    # 构造确认提示
+    # 构造结构化 output（供前端 Builder 面板解析渲染）
+    # 格式：{"diff": {"files": [{path, old_content, new_content, diff}], "explanation": "..."}}
     action_desc = "追加" if mode == "append" else "覆盖写入"
+    files = [{
+        "path": file_path,
+        "old_content": old_content,
+        "new_content": new_content,
+        "diff": diff_text or f"[Diff 预览不可用]\n原内容长度: {len(old_content)}\n新内容长度: {len(new_content)}",
+    }]
+    structured_output = {
+        "diff": {
+            "files": files,
+            "explanation": f"{action_desc}文件 {file_path}，共 {len(new_content)} 字符"
+                           f"（{'新增文件' if not old_content else '已存在文件'}）",
+        }
+    }
+
+    # 构造确认提示
     prompt = f"即将{action_desc}文件 {file_path}（{len(content)} 字符），是否继续？"
 
     return ToolResult(
         success=True,
-        output=diff_text or f"[Diff 预览不可用]\n原内容长度: {len(old_content)}\n新内容长度: {len(content)}",
+        output=structured_output,
         requires_confirmation=True,
         confirmation_prompt=prompt,
     )
@@ -614,9 +665,11 @@ async def _do_write_file(
     except OSError as e:
         return ToolResult(success=False, error=f"创建目录失败: {e}")
 
+    # S8 第 79-80 天：Docker 模式下宿主路径 → /workspace/xxx
+    sandbox_path = await _to_sandbox_path(str(full_path))
     try:
         open_mode = "a" if mode == "append" else "w"
-        with open(full_path, open_mode, encoding="utf-8") as f:
+        with open(sandbox_path, open_mode, encoding="utf-8") as f:
             # 分块写入（每块 64KB），应对大文件 OOM 风险
             chunk_size = 64 * 1024
             for i in range(0, len(content), chunk_size):
@@ -697,22 +750,15 @@ async def _do_run_command(
     """
     run_command 的真正执行逻辑（用户确认后由 confirm_tool 调用）。
 
-    S8 第 75-76 天：委托给 CommandExecutor 实现：
-      - 流式输出：stdout/stderr 通过 CommandStreamManager 实时推送
-        给 WebSocket 订阅者（/v1/agent/stream/{session_id}）。
-      - 进程组隔离：start_new_session / CREATE_NEW_PROCESS_GROUP，
-        方便 SIGTERM 杀死整个进程组。
-      - 命令注入防护：shlex.split 列表参数模式。
+    S8 第 79-80 天：命令执行统一走 SandboxOrchestrator，
+      - HostSandbox：透传到宿主机 CommandExecutor（行为不变）
+      - DockerSandbox：在容器内 docker exec 执行
 
     风险预警应对：
       - 交互式命令二次检测（安全网，防止绕过 tool_run_command 直接调用 confirm）。
-      - 超时杀进程：先 SIGTERM 后 SIGKILL（在 CommandExecutor._kill_process_group）。
+      - 超时杀进程：CommandExecutor 内部已实现；Docker 模式下由 DockerSandbox 处理。
     """
-    from app.services.command_executor import (
-        CommandExecutor,
-        get_command_executor,
-        is_interactive_command,
-    )
+    from app.services.command_executor import is_interactive_command
 
     cmd = arguments["cmd"]
     timeout = float(
@@ -732,9 +778,10 @@ async def _do_run_command(
             requires_interaction=True,
         )
 
-    executor = get_command_executor()
+    # S8 第 79-80 天：统一走沙箱编排器
+    orch = await _get_sandbox_orchestrator()
     try:
-        exit_code, stdout_text, stderr_text = await executor.execute(
+        exit_code, stdout_text, stderr_text = await orch.execute_command(
             cmd=cmd,
             workspace_root=workspace_root,
             session_id=session_id,
@@ -746,6 +793,10 @@ async def _do_run_command(
         return ToolResult(success=False, error=str(e))
     except OSError as e:
         return ToolResult(success=False, error=str(e))
+
+    # DockerSandbox 沙箱不可用时 exit_code=-1，stderr 里是错误信息
+    if exit_code == -1 and stderr_text and "沙箱" in stderr_text:
+        return ToolResult(success=False, error=stderr_text.strip())
 
     output = stdout_text
     if stderr_text:
@@ -832,7 +883,8 @@ async def _grep_with_ripgrep(
     - 使用 `-C {context_lines}` 输出匹配行前后的上下文行。
     - 使用 `--glob '!**/node_modules/**'` 等跳过大型依赖目录，
       防止在 node_modules 中卡死（S8 风险预警）。
-    - 使用列表参数模式（create_subprocess_exec），杜绝命令注入。
+    - S8 第 79-80 天：统一走 SandboxOrchestrator.execute_command，
+      Docker 模式下 ripgrep 在容器内执行。
     """
     # 跳过的大型目录 glob 模式（与 Python 降级实现的 skip_dirs 保持一致）
     skip_globs = [
@@ -856,24 +908,25 @@ async def _grep_with_ripgrep(
         args += ["--glob", g]
     args += [pattern, search_path]
 
+    cmd_str = shlex.join(args)
+    orch = await _get_sandbox_orchestrator()
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=workspace_root or None,
+        exit_code, stdout_text, stderr_text = await orch.execute_command(
+            cmd=cmd_str,
+            workspace_root=workspace_root,
+            session_id="grep-internal",
+            timeout=settings.TOOL_GREP_TIMEOUT_SECONDS,
         )
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=settings.TOOL_GREP_TIMEOUT_SECONDS
-        )
-        if proc.returncode in (0, 1):  # 0=有匹配, 1=无匹配
-            raw_output = stdout.decode("utf-8", errors="replace")
+        if exit_code in (0, 1):  # 0=有匹配, 1=无匹配
+            raw_output = stdout_text
             # 路径归一化：ripgrep 在 Windows 上输出反斜杠，且搜索 "." 时前缀 ".\"
             # 统一为正斜杠并去除 "./" 前缀，与 Python 降级模式输出保持一致
             output = _normalize_ripgrep_paths(raw_output)
             return ToolResult(success=True, output=output)
+        logger.info(f"[ToolRegistry] ripgrep 退出码={exit_code}, stderr={stderr_text.strip()}")
         return None
-    except (asyncio.TimeoutError, OSError):
+    except Exception as e:
+        logger.info(f"[ToolRegistry] ripgrep 执行失败，降级到 Python: {e}")
         return None
 
 
@@ -1039,18 +1092,60 @@ async def tool_git_commit(
     # 更新 arguments 确保 message 字段完整（供后续 confirm_tool 使用）
     arguments["message"] = message
 
-    # 构造确认提示
+    # ---- 构造结构化 output（供前端 Builder 面板解析渲染）----
+    # 格式：{"commit_message": "...", "git_changes": [{path, status, additions, deletions}], "diff": {文件级 diff}}
+    try:
+        raw_changes = _parse_git_status_short(status_output)
+        numstat = await _get_git_numstat(workspace_root)
+        git_changes = []
+        for c in raw_changes:
+            add_n, del_n = numstat.get(c["path"], (0, 0))
+            git_changes.append({
+                "path": c["path"],
+                "status": c["status"],
+                "additions": add_n,
+                "deletions": del_n,
+            })
+
+        # 构造文件级 diff 数组（复用 write_file 的同款格式）
+        diff_files = []
+        try:
+            for c in git_changes:
+                # 只对 staged diff 做结构化（避免未暂存的文件 diff 混进来）
+                dr = await _run_git(["diff", "--staged", "--", c["path"]], workspace_root)
+                diff_files.append({
+                    "path": c["path"],
+                    "old_content": "",
+                    "new_content": "",
+                    "diff": dr.output if dr.success else "",
+                })
+        except Exception as de:
+            logger.warning(f"[ToolRegistry] git diff --staged 获取失败: {de}")
+
+        structured_output = {
+            "commit_message": message,
+            "git_changes": git_changes,
+            "diff": {
+                "files": diff_files,
+                "explanation": f"提交 {len(git_changes)} 个文件变更",
+            },
+        }
+    except Exception as e:
+        # 降级：返回纯文本 output，不阻断流程
+        logger.warning(f"[ToolRegistry] git_commit 结构化预览失败，降级纯文本: {e}")
+        ai_hint = "（AI 自动生成）" if auto_generated else ""
+        structured_output = f"[变更文件]\n{status_output}\n\n[Commit Message{ai_hint}]\n{message}"
+
+    # 构造确认提示（仍用原始纯文本，便于弹出的浮层直接阅读）
     ai_hint = "（AI 自动生成）" if auto_generated else ""
     prompt = (
         f"即将执行 git commit，提交信息{ai_hint}：\n{message}\n\n"
         f"涉及变更文件：\n{status_output}\n\n是否继续？"
     )
 
-    output = f"[变更文件]\n{status_output}\n\n[Commit Message{ai_hint}]\n{message}"
-
     return ToolResult(
         success=True,
-        output=output,
+        output=structured_output,
         requires_confirmation=True,
         confirmation_prompt=prompt,
     )
@@ -1111,32 +1206,118 @@ async def _do_git_commit(
 
 
 async def _run_git(args: list[str], workspace_root: str) -> ToolResult:
-    """执行 git 子命令的内部辅助函数。"""
+    """
+    执行 git 子命令的内部辅助函数。
+
+    S8 第 79-80 天：统一走 SandboxOrchestrator.execute_command，
+      - HostSandbox：宿主直接 git
+      - DockerSandbox：容器内 git（cwd 固定 /workspace = 挂载点）
+    """
+    cmd_str = "git " + shlex.join(args)
+    orch = await _get_sandbox_orchestrator()
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "git", *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=workspace_root or None,
+        exit_code, stdout_text, stderr_text = await orch.execute_command(
+            cmd=cmd_str,
+            workspace_root=workspace_root,
+            session_id="git-internal",
+            timeout=settings.TOOL_COMMAND_DEFAULT_TIMEOUT,
         )
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=settings.TOOL_COMMAND_DEFAULT_TIMEOUT
-        )
-        stdout_text = stdout.decode("utf-8", errors="replace")
-        stderr_text = stderr.decode("utf-8", errors="replace")
-        if proc.returncode != 0:
+        if exit_code != 0:
             return ToolResult(
                 success=False,
                 output=stdout_text,
-                error=stderr_text or f"git {' '.join(args)} 退出码 {proc.returncode}",
+                error=stderr_text or f"git {' '.join(args)} 退出码 {exit_code}",
             )
         return ToolResult(success=True, output=stdout_text)
-    except asyncio.TimeoutError:
-        return ToolResult(success=False, error=f"git {' '.join(args)} 超时")
-    except FileNotFoundError:
-        return ToolResult(success=False, error="git 未安装")
-    except OSError as e:
+    except Exception as e:
         return ToolResult(success=False, error=f"git 执行失败: {e}")
+
+
+# ============================================================
+# S8 第 77-78 天：git_commit 结构化预览辅助函数
+# ============================================================
+
+def _parse_git_status_short(status_output: str) -> list[dict]:
+    """
+    解析 git status --short 输出为结构化变更列表。
+
+    格式约定（git status --short）：
+      XY PATHNAME
+      X = 暂存区状态码（空格=未暂存）
+      Y = 工作区状态码（空格=无变更）
+      状态码：M=修改, A=新增, D=删除, R=重命名, C=复制, ?=未跟踪
+
+    Returns:
+        [{"path": "...", "status": "M|A|D|..."}]
+    """
+    changes = []
+    for line in status_output.splitlines():
+        line = line.rstrip()
+        if not line:
+            continue
+        # 前两列是状态码，后面是路径
+        if len(line) < 4:
+            continue
+        x = line[0]
+        y = line[1]
+        rest = line[3:]  # 跳过两状态码 + 一个空格
+
+        # 暂存区优先，fallback 到工作区
+        status_code = x if x != " " else y
+        # 归一化状态码：常见的 M/A/D/R/?, 其他归为 "?"
+        known = set("MADRC?U")
+        if status_code not in known:
+            status_code = "?"
+
+        # 重命名/复制的路径格式：old -> new，只取 new
+        if " -> " in rest:
+            rest = rest.split(" -> ", 1)[1]
+
+        changes.append({"path": rest, "status": status_code})
+    return changes
+
+
+async def _get_git_numstat(workspace_root: str) -> dict[str, tuple[int, int]]:
+    """
+    获取每个文件的 additions/deletions 行数。
+
+    优先级：git diff --numstat --staged → git diff --numstat（兜底）
+
+    Returns:
+        {file_path: (additions, deletions)}。
+        纯新增文件 additions=行数, deletions=0；纯删除文件 additions=0, deletions=行数。
+        无法获取时返回空 dict（不阻断主流程）。
+    """
+    numstat: dict[str, tuple[int, int]] = {}
+    try:
+        # 1. 优先 staged
+        r = await _run_git(["diff", "--numstat", "--staged"], workspace_root)
+        if r.success:
+            for line in r.output.splitlines():
+                parts = line.split("\t")
+                if len(parts) >= 3:
+                    add_s, del_s, path = parts[0], parts[1], parts[2]
+                    add_n = int(add_s) if add_s.isdigit() else 0
+                    del_n = int(del_s) if del_s.isdigit() else 0
+                    numstat[path] = (add_n, del_n)
+
+        # 2. 未暂存但已修改的文件
+        r2 = await _run_git(["diff", "--numstat"], workspace_root)
+        if r2.success:
+            for line in r2.output.splitlines():
+                parts = line.split("\t")
+                if len(parts) >= 3:
+                    add_s, del_s, path = parts[0], parts[1], parts[2]
+                    if path not in numstat:  # staged 已有的不覆盖
+                        add_n = int(add_s) if add_s.isdigit() else 0
+                        del_n = int(del_s) if del_s.isdigit() else 0
+                        numstat[path] = (add_n, del_n)
+
+        # 3. 未跟踪文件（git diff 不会显示）：用 wc -l 或置 0
+        # 这里简化：未跟踪文件 additions/deletions 都记为 0
+    except Exception as e:
+        logger.warning(f"[ToolRegistry] 获取 git numstat 失败: {e}")
+    return numstat
 
 
 # ============================================================

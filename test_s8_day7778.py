@@ -92,8 +92,11 @@ def test_git_commit_needs_confirmation_when_changes_exist(git_workspace):
     assert result.requires_confirmation is True
     assert result.confirmation_id is not None
     assert result.confirmation_prompt is not None
-    # output 里应包含变更文件信息
-    assert "main.py" in result.output or "M" in result.output or "??" in result.output
+    # output 应为结构化 dict
+    assert isinstance(result.output, dict)
+    assert "commit_message" in result.output
+    assert "git_changes" in result.output
+    assert any(c["path"] == "main.py" for c in result.output["git_changes"])
 
 
 def test_git_commit_explicit_message_used_directly(git_workspace):
@@ -190,8 +193,8 @@ def test_git_commit_auto_generate_message_llm_success(git_workspace):
     # confirmation_prompt 里应包含 AI 生成的 message + "AI 自动生成" 标记
     assert mock_message in result.confirmation_prompt
     assert "AI 自动生成" in result.confirmation_prompt
-    # output 里也应包含
-    assert mock_message in result.output
+    # output 是结构化 dict，commit_message 字段应包含 AI 生成的 message
+    assert result.output["commit_message"] == mock_message
 
 
 def test_git_commit_auto_generate_message_fallback_when_llm_returns_none(git_workspace):
@@ -431,7 +434,7 @@ def test_git_commit_e2e_with_auto_message_and_confirm(git_workspace):
     assert exec_result.success is True
     assert exec_result.requires_confirmation is True
     assert "AI 自动生成" in exec_result.confirmation_prompt
-    assert "feat(flask): 初始化 Flask 项目骨架" in exec_result.output
+    assert exec_result.output["commit_message"] == "feat(flask): 初始化 Flask 项目骨架"
 
     # Step 3: confirm allow → 真正 commit
     confirm_result = asyncio.run(confirm_tool(exec_result.confirmation_id, "allow", "e2e-session"))

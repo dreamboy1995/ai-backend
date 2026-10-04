@@ -9,7 +9,6 @@ from app.services.tool_executor import set_default_tool_executor, MCPToolExecuto
 
 logger = logging.getLogger(__name__)
 
-
 async def _session_cleanup_loop():
     """
     后台任务：定期清理过期的会话（S2 第 19-20 天）。
@@ -44,6 +43,17 @@ async def lifespan(app: FastAPI):
     logger.info("Starting AI Backend application")
     # S8: 将默认执行器从 Mock 切换为 MCP（含确认链路）
     set_default_tool_executor(MCPToolExecutor())
+
+    # S8 第 79-80 天：初始化沙箱编排器
+    # 首次 initialize 会触发 Docker 可用性检测，Docker 不可用时自动降级 host 模式
+    from app.services.sandbox_orchestrator import get_sandbox_manager
+    sandbox_manager = get_sandbox_manager()
+    sandbox_orchestrator = await sandbox_manager.initialize()
+    logger.info(
+        f"[Sandbox] 沙箱编排器已就绪: mode={sandbox_manager.chosen_mode}, "
+        f"type={type(sandbox_orchestrator).__name__}"
+    )
+
     cleanup_task = asyncio.create_task(_session_cleanup_loop())
     try:
         yield
@@ -53,4 +63,9 @@ async def lifespan(app: FastAPI):
             await cleanup_task
         except asyncio.CancelledError:
             pass
+        # S8 第 79-80 天：服务关闭时清理 Docker 容器
+        try:
+            await sandbox_manager.shutdown()
+        except Exception as e:
+            logger.warning(f"[Sandbox] 沙箱关闭清理异常: {e}")
         logger.info("Shutting down AI Backend application")

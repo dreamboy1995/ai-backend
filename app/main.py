@@ -31,6 +31,7 @@ from app.api.cue import router as cue_router
 from app.api.agent import router as agent_router
 from app.api.tool import router as tool_router
 from app.api.stream import router as stream_router
+from app.api.sandbox import router as sandbox_router
 
 # 日志配置必须在所有日志调用之前执行
 setup_logging()
@@ -115,6 +116,8 @@ def create_app() -> FastAPI:
     # 路径前缀 /v1，使最终 URL 为 /v1/agent/stream/{session_id}，
     # 与 Sprint_8.md 关键接口定义一致。
     app.include_router(stream_router, prefix="/v1", tags=["流式日志"])
+    # S8 第 79-80 天：沙箱状态接口
+    app.include_router(sandbox_router, prefix="/v1/sandbox", tags=["沙箱"])
 
     # 基础路由
     @app.get("/", tags=["默认"])

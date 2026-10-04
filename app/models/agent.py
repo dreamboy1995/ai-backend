@@ -47,11 +47,14 @@ END_REASON_COMPLETED = "completed"
 END_REASON_MAX_ITER = "max_iter"
 END_REASON_TIMEOUT = "timeout"
 END_REASON_ERROR = "error"
+# S8 第 79-80 天：熔断机制。Agent 连续失败 TOOL_FAIL_FUSE_LIMIT 次后自动暂停，
+# 提示"任务执行遇到困难，请人工介入"。属于可恢复状态（人工介入后可 resume）。
+END_REASON_FUSED = "fused"
 
 # 终态原因：会话已死亡，不允许再次 start/resume/pause
 TERMINAL_END_REASONS = {END_REASON_COMPLETED, END_REASON_MAX_ITER, END_REASON_TIMEOUT, END_REASON_ERROR}
-# 可恢复原因：暂停/等待用户/等待确认，允许 resume
-RESUMABLE_END_REASONS = {END_REASON_PAUSED, END_REASON_ASK_USER, END_REASON_CONFIRMING}
+# 可恢复原因：暂停/等待用户/等待确认/熔断，允许 resume
+RESUMABLE_END_REASONS = {END_REASON_PAUSED, END_REASON_ASK_USER, END_REASON_CONFIRMING, END_REASON_FUSED}
 
 
 class TaskStep(BaseModel):
@@ -121,12 +124,19 @@ class AgentSession(BaseModel):
     pending_confirmation_prompt: Optional[str] = Field(
         default=None, description="确认浮层展示给用户的提示文本"
     )
-    pending_confirmation_preview: Optional[str] = Field(
-        default=None, description="确认前的预览内容（Diff / 命令 / 文件列表）"
+    pending_confirmation_preview: Optional[Any] = Field(
+        default=None, description="确认前的预览内容（diff dict / git_changes dict / 命令文本）"
     )
     pending_confirmation_tool: Optional[str] = Field(
         default=None, description="待确认的工具名（write_file / run_command / git_commit）"
     )
+    # S8 第 79-80 天：熔断机制
+    # 连续工具执行失败计数。每次工具成功时重置为 0，失败时 +1。
+    # 达到 TOOL_FAIL_FUSE_LIMIT（默认 3）时触发熔断，自动暂停循环并提示人工介入。
+    consecutive_failures: int = Field(default=0, ge=0, description="连续失败计数（熔断阈值 TOOL_FAIL_FUSE_LIMIT）")
+    # S8 第 79-80 天：沙箱模式（会话实际生效的模式）
+    # 初始化时由 react_loop.start_agent_loop 写入，可能因 Docker 不可用而从 docker 降级到 host。
+    sandbox_mode: str = Field(default="", description="会话实际沙箱模式：docker / host（空字符串表示未初始化）")
     # 会话结束原因与描述（持久化到 Redis，供前端判断会话是否已死亡）
     # 取值见 END_REASON_* 常量；None 表示运行中或未开始
     end_reason: Optional[str] = Field(default=None, description="会话结束原因")
@@ -225,8 +235,14 @@ class AgentStatusResponse(BaseModel):
     # S8 确认链路：供前端 Builder 面板弹「确认写入」浮层
     pending_confirmation_id: Optional[str] = Field(default=None, description="工具确认凭证 ID")
     pending_confirmation_prompt: Optional[str] = Field(default=None, description="确认浮层提示文本")
-    pending_confirmation_preview: Optional[str] = Field(default=None, description="确认前预览（Diff/命令等）")
+    pending_confirmation_preview: Optional[Any] = Field(default=None, description="确认前预览（diff dict / git_changes dict / 命令文本）")
     pending_confirmation_tool: Optional[str] = Field(default=None, description="待确认工具名")
+    # S8 第 79-80 天：熔断状态（前端判断是否需要提示用户人工介入）
+    consecutive_failures: int = Field(default=0, description="连续失败计数")
+    is_fused: bool = Field(default=False, description="是否已触发熔断（end_reason == 'fused'）")
+    fused_threshold: int = Field(default=3, description="熔断阈值 TOOL_FAIL_FUSE_LIMIT")
+    # S8 第 79-80 天：沙箱模式（前端设置面板显示）
+    sandbox_mode: str = Field(default="", description="会话实际生效的沙箱模式：docker / host")
 
 
 class ToolConfirmRequest(BaseModel):

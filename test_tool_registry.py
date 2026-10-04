@@ -139,8 +139,14 @@ def test_execute_write_file_requires_confirmation(tmp_workspace):
     assert result.requires_confirmation is True
     assert result.confirmation_id is not None
     assert result.confirmation_prompt is not None
-    # 新增文件的 Diff 应包含 +++ 标记
-    assert "+++" in result.output or "新增" in result.output or "新内容" in result.output
+    # 新增文件的 output 应为结构化 dict
+    assert isinstance(result.output, dict)
+    assert "diff" in result.output
+    assert "files" in result.output["diff"]
+    assert len(result.output["diff"]["files"]) == 1
+    file_preview = result.output["diff"]["files"][0]
+    assert file_preview["path"] == "new.py"
+    assert "+++" in file_preview["diff"] or "新增" in result.output["diff"].get("explanation", "")
 
     # 确认前文件不应被创建
     assert not (Path(tmp_workspace) / "new.py").exists()

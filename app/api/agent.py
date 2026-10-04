@@ -20,6 +20,7 @@ import logging
 
 from fastapi import APIRouter, HTTPException
 
+from app.config import settings
 from app.models.agent import (
     AgentActionResponse,
     AgentSession,
@@ -167,6 +168,12 @@ async def get_status(session_id: str):
         pending_confirmation_prompt=session.pending_confirmation_prompt,
         pending_confirmation_preview=session.pending_confirmation_preview,
         pending_confirmation_tool=session.pending_confirmation_tool,
+        # S8 第 79-80 天：熔断状态
+        consecutive_failures=session.consecutive_failures,
+        is_fused=session.end_reason == "fused",
+        fused_threshold=settings.TOOL_FAIL_FUSE_LIMIT,
+        # S8 第 79-80 天：沙箱模式
+        sandbox_mode=session.sandbox_mode,
     )
 
 

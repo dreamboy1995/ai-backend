@@ -56,7 +56,11 @@ class ToolResult(BaseModel):
     工具执行结果。
 
     - success:             是否执行成功。
-    - output:              成功时的输出文本（文件内容 / 命令 stdout / 搜索结果等）。
+    - output:              成功时的输出。普通工具为 str（文件内容 / 命令 stdout / 搜索结果等）；
+                  需要确认的工具（write_file / git_commit）为结构化 dict，格式见下：
+                    * write_file: {"diff": {"files": [{path, old_content, new_content, diff}], "explanation": "..."}}
+                    * git_commit: {"commit_message": "...", "git_changes": [{path, status, additions, deletions}], "diff": {...同上}}
+                    * run_command: 纯 str，如 "npm install flask"
     - error:               失败时的错误描述。
     - requires_confirmation: 是否需要用户手动确认。为 True 时，
                   插件端应弹出确认框，用户确认后调用 /v1/tool/confirm。
@@ -70,7 +74,7 @@ class ToolResult(BaseModel):
     """
 
     success: bool
-    output: str = ""
+    output: Any = ""
     error: Optional[str] = None
     requires_confirmation: bool = False
     confirmation_prompt: Optional[str] = None

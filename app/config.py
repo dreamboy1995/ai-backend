@@ -292,6 +292,37 @@ class Settings(BaseSettings):
     # 审计日志可选截断 ToolResult.output（避免大输出撑爆日志文件），0 表示不截断
     TOOL_AUDIT_LOG_OUTPUT_MAX_CHARS: int = 500
 
+    # ============================================================
+    # S8 第 79-80 天：Docker 沙箱与熔断配置
+    # ============================================================
+    # 沙箱模式：
+    #   - "docker"  : 所有文件操作和命令执行都在 Docker 容器内（默认，推荐）
+    #   - "host"    : 直接在宿主机子进程中执行（不推荐，但 Docker 不可用时自动降级）
+    #   - "auto"    : 自动检测 Docker 可用性，优先 docker，不可用时降级 host
+    SANDBOX_MODE: str = "docker"
+
+    # Docker 沙箱配置（仅 SANDBOX_MODE="docker" 时生效）
+    SANDBOX_DOCKER_IMAGE: str = "python:3.11-slim"       # 基础镜像
+    SANDBOX_DOCKER_CPU_LIMIT: float = 0.5                # CPU 配额（核）
+    SANDBOX_DOCKER_MEMORY_LIMIT_MB: int = 512            # 内存限制（MB）
+    SANDBOX_DOCKER_NETWORK_DISABLED: bool = True         # 默认禁止容器访问外网
+    # Windows/Mac Docker Desktop 文件挂载 IO 较慢，可通过环境变量开启 :delegated 模式
+    # （牺牲一点一致性换性能，S8 风险预警）
+    SANDBOX_DOCKER_MOUNT_MODE: str = "cached"            # cached / delegated / consistent
+    # 是否允许容器访问宿主机 localhost（S8 风险预警：默认关闭，用户手动开启）
+    SANDBOX_DOCKER_ALLOW_HOST_GATEWAY: bool = False
+
+    # 容器生命周期
+    # 是否在服务关闭时自动清理空闲容器（True=自动清理）
+    SANDBOX_DOCKER_AUTO_CLEANUP: bool = True
+    # 空闲容器最大存活时间（秒）。超过则自动停止，下次请求时重新创建
+    SANDBOX_DOCKER_IDLE_TIMEOUT_SECONDS: int = 3600       # 1 小时
+
+    # 熔断机制（S8 第 79-80 天）：
+    # Agent 连续失败 N 次后，自动暂停循环并提示"任务执行遇到困难，请人工介入"。
+    # 防止 Agent 在某个步骤反复撞墙、空耗 Token。
+    TOOL_FAIL_FUSE_LIMIT: int = 3
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

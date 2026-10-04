@@ -39,6 +39,7 @@ from app.models.agent import (
     END_REASON_COMPLETED,
     END_REASON_CONFIRMING,
     END_REASON_ERROR,
+    END_REASON_FUSED,
     END_REASON_MAX_ITER,
     END_REASON_PAUSED,
     END_REASON_TIMEOUT,
@@ -443,6 +444,16 @@ async def run_agent(
     exit_reason = END_REASON_COMPLETED  # 默认 completed
     end_message: Optional[str] = None  # 会话结束描述，对应 end_reason
 
+    # S8 第 79-80 天：同步会话沙箱模式 + 熔断计数重置
+    try:
+        from app.services.sandbox_orchestrator import get_sandbox_manager
+        session.sandbox_mode = get_sandbox_manager().chosen_mode
+    except Exception:
+        session.sandbox_mode = "host"  # 降级
+    # 循环启动时重置连续失败计数（可能是熔断恢复后的新循环）
+    session.consecutive_failures = 0
+    store.save(session)
+
     logger.info(
         f"[ReAct] 循环开始: session={session_id}, "
         f"total_steps={session.total_steps}, model={session.model}"
@@ -612,17 +623,57 @@ async def run_agent(
 
             # ---- Observe（观察）----
             observation = result.output or f"工具 {tool} 执行成功"
-            if not result.success:
-                # 执行器返回 success=False（非确认、非交互、真实失败）
-                err_msg = result.error or "工具执行失败"
+
+            if result.requires_interaction:
+                # 需要用户手动执行（如 python REPL / npm init 无 --yes）
+                # 不计入连续失败——这是正常的"需要人工介入"场景，不是 Agent 执行失败
+                err_msg = result.error or "命令需要交互式输入"
                 sm.mark_failed(step.id, err_msg)
+                session.consecutive_failures = 0  # 不算连续失败，重置
                 _save_preserving_flags(session, store)
-                logger.warning(
-                    f"[ReAct] 工具执行失败 step={step.id}: {err_msg}"
+                logger.info(
+                    f"[ReAct] 步骤 {step.id} 需要交互式输入，提示用户手动执行: {tool}"
                 )
                 continue
 
+            if not result.success:
+                # 执行器返回 success=False（真实失败：命令 exit_code!=0 / 文件权限不足 / 黑名单拦截等）
+                err_msg = result.error or "工具执行失败"
+                sm.mark_failed(step.id, err_msg)
+
+                # S8 第 79-80 天：熔断机制——连续失败计数
+                # deny 不算（Agent 无法控制用户决策），交互式不算（已在上面处理）
+                session.consecutive_failures += 1
+                logger.warning(
+                    f"[ReAct] 工具执行失败 step={step.id}: {err_msg}. "
+                    f"连续失败={session.consecutive_failures}/{settings.TOOL_FAIL_FUSE_LIMIT}"
+                )
+
+                # 达到熔断阈值 → 暂停循环，提示人工介入
+                if session.consecutive_failures >= settings.TOOL_FAIL_FUSE_LIMIT:
+                    exit_reason = END_REASON_FUSED
+                    fuse_msg = (
+                        f"Agent 连续 {settings.TOOL_FAIL_FUSE_LIMIT} 次执行失败，"
+                        f"触发熔断，已自动暂停。请人工检查后再恢复执行。"
+                    )
+                    session.final_answer = fuse_msg
+                    end_message = fuse_msg
+                    session.is_executing = False
+                    session.is_paused = True
+                    session.interrupt_flag = True
+                    _save_preserving_flags(session, store)
+                    logger.warning(
+                        f"[ReAct] 熔断触发: session={session_id}, "
+                        f"failures={session.consecutive_failures}, step={step.id}"
+                    )
+                    break
+
+                _save_preserving_flags(session, store)
+                continue
+
+            # success=True：重置连续失败计数
             sm.mark_done(step.id, observation)
+            session.consecutive_failures = 0
             _save_preserving_flags(session, store)
             logger.info(
                 f"[ReAct] << Observe: step={step.id} done, "
