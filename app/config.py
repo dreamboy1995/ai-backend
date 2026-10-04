@@ -233,6 +233,44 @@ class Settings(BaseSettings):
     # 对应 S7 风险预警："ReAct 循环中的上下文爆炸……只保留最近 3 步的完整观察结果"
     REACT_CONTEXT_WINDOW: int = 3
 
+    # ============================================================
+    # S8 第 71-72 天：工具执行层配置
+    # ============================================================
+    # 审计日志文件路径（JSON Lines 格式）。
+    # 记录每次工具调用的 tool_name、arguments、result、timestamp，
+    # 用于后续调试和 P4 阶段的数据飞轮。
+    TOOL_AUDIT_LOG_PATH: str = ".ai_logs/audit.log"
+
+    # 待确认操作的 TTL（秒）。
+    # write_file / run_command 等需要用户确认的操作，生成的 confirmation_id
+    # 在此时间内有效，超时后自动失效（防止确认凭证被长期滥用）。
+    TOOL_CONFIRMATION_TTL_SECONDS: int = 300
+
+    # read_file 安全限制：文件大小超过该值（字节）时自动截断，
+    # 返回前 N 行 + 后 N 行，并附带警告。
+    TOOL_READ_FILE_MAX_BYTES: int = 1 * 1024 * 1024  # 1MB
+    TOOL_READ_FILE_HEAD_LINES: int = 500
+    TOOL_READ_FILE_TAIL_LINES: int = 500
+
+    # grep_search 搜索超时（秒），防止在 node_modules 中卡死。
+    TOOL_GREP_TIMEOUT_SECONDS: float = 5.0
+
+    # run_command 危险命令黑名单（正则模式）。
+    # 匹配到的命令直接拒绝执行，无需用户确认。
+    # 对应 S8 风险预警："危险命令拦截器（黑名单）"。
+    TOOL_DANGER_COMMAND_PATTERNS: list[str] = [
+        r"rm\s+-rf\s+/",            # 删除根目录
+        r"rm\s+-rf\s+/\*",          # 删除根目录下所有
+        r"dd\s+if=/dev/zero",       # 破坏硬盘
+        r":\(\)\s*\{\s*:\s*\|\s*:&\s*\}\s*;:",  # Fork 炸弹
+        r"\bsudo\b",                # 提权命令
+    ]
+
+    # run_command 默认超时（秒）。
+    # 长任务如 npm install 可通过 arguments.timeout 延长。
+    TOOL_COMMAND_DEFAULT_TIMEOUT: float = 60.0
+    TOOL_COMMAND_MAX_TIMEOUT: float = 300.0
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

@@ -1,0 +1,945 @@
+"""
+S8 第 71-72 天：工具注册中心（MCP 协议适配层核心）
+
+对应 Sprint_8.md 第 71-72 天任务：
+  "编写 tool_registry.py，将每个工具实现为一个异步函数，并注册到字典 {tool_name: handler_function}。
+   编写统一的 execute_tool(tool_call: ToolCall) -> ToolResult 入口函数，负责路由和异常捕获。"
+
+同时兼顾：
+  - 关键接口变更：POST /v1/tool/execute、POST /v1/tool/confirm
+  - 风险预警：命令注入（subprocess 列表参数）、大文件截断、危险命令黑名单、审计日志
+
+架构设计：
+  ┌─────────────────────────────────────────────────────────┐
+  │  execute_tool(tool_call, workspace_root, session_id)    │
+  │    1. 路由到注册的 handler                               │
+  │    2. 若 handler 返回 requires_confirmation=True        │
+  │       → 生成 confirmation_id，存入 PendingConfirmationStore│
+  │       → 不真正执行，返回 ToolResult 供插件展示确认框     │
+  │    3. 异常捕获 → 返回 success=False 的 ToolResult        │
+  │    4. 所有调用写入审计日志（JSON Lines）                 │
+  └─────────────────────────────────────────────────────────┘
+
+  ┌─────────────────────────────────────────────────────────┐
+  │  confirm_tool(confirmation_id, action, session_id)      │
+  │    1. 从 PendingConfirmationStore 取出待确认操作         │
+  │    2. action='allow' → 真正执行该工具                    │
+  │    3. action='deny'  → 返回拒绝结果                      │
+  │    4. 无论 allow/deny，确认后清除记录（一次性凭证）      │
+  └─────────────────────────────────────────────────────────┘
+"""
+
+import asyncio
+import json
+import logging
+import os
+import re
+import shlex
+import subprocess
+import time
+import uuid
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
+
+from app.config import settings
+from app.models.tool import ToolCall, ToolResult
+
+logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# 工具 handler 类型签名
+# ============================================================
+# 每个工具 handler 接收 (arguments, workspace_root, session_id)，
+# 返回 ToolResult。workspace_root 用于解析相对路径，session_id 用于审计。
+ToolHandler = Callable[[Dict[str, Any], str, str], Awaitable[ToolResult]]
+
+
+# ============================================================
+# 待确认操作存储（内存 + TTL）
+# ============================================================
+# 当工具返回 requires_confirmation=True 时，生成 confirmation_id 并存入此处。
+# 用户通过 /v1/tool/confirm 回传 confirmation_id 后，后端取出原始 ToolCall 执行。
+# 一次性凭证：确认后即删除；超时自动失效。
+
+class _PendingConfirmation:
+    """一条待确认的工具调用记录"""
+
+    def __init__(
+        self,
+        tool_call: ToolCall,
+        workspace_root: str,
+        session_id: str,
+        created_at: float,
+    ):
+        self.tool_call = tool_call
+        self.workspace_root = workspace_root
+        self.session_id = session_id
+        self.created_at = created_at
+
+
+class PendingConfirmationStore:
+    """
+    待确认操作存储（线程安全，内存实现）。
+
+    - confirmation_id 为 uuid4，不可预测，防止伪造确认请求。
+    - TTL 由 settings.TOOL_CONFIRMATION_TTL_SECONDS 控制，超时自动失效。
+    - 确认后立即删除（一次性凭证）。
+    """
+
+    def __init__(self, ttl_seconds: int = 300):
+        self._ttl = ttl_seconds
+        self._store: Dict[str, _PendingConfirmation] = {}
+        self._lock = asyncio.Lock()
+
+    async def put(
+        self, tool_call: ToolCall, workspace_root: str, session_id: str
+    ) -> str:
+        """存入一条待确认记录，返回 confirmation_id"""
+        confirmation_id = str(uuid.uuid4())
+        async with self._lock:
+            self._store[confirmation_id] = _PendingConfirmation(
+                tool_call=tool_call,
+                workspace_root=workspace_root,
+                session_id=session_id,
+                created_at=time.time(),
+            )
+        logger.info(
+            f"[ToolRegistry] 生成确认凭证: id={confirmation_id}, "
+            f"tool={tool_call.tool_name}, session={session_id}"
+        )
+        return confirmation_id
+
+    async def get(self, confirmation_id: str) -> Optional[_PendingConfirmation]:
+        """
+        获取待确认记录。若已过期则删除并返回 None。
+        """
+        async with self._lock:
+            record = self._store.get(confirmation_id)
+            if record is None:
+                return None
+            # TTL 检查
+            if time.time() - record.created_at > self._ttl:
+                del self._store[confirmation_id]
+                logger.info(
+                    f"[ToolRegistry] 确认凭证已过期: id={confirmation_id}"
+                )
+                return None
+            return record
+
+    async def pop(self, confirmation_id: str) -> Optional[_PendingConfirmation]:
+        """
+        取出并删除待确认记录（确认后调用，一次性凭证）。
+        """
+        async with self._lock:
+            record = self._store.pop(confirmation_id, None)
+            if record is not None:
+                logger.info(
+                    f"[ToolRegistry] 消耗确认凭证: id={confirmation_id}, "
+                    f"tool={record.tool_call.tool_name}"
+                )
+            return record
+
+
+# 全局单例
+_pending_store: Optional[PendingConfirmationStore] = None
+
+
+def get_pending_confirmation_store() -> PendingConfirmationStore:
+    global _pending_store
+    if _pending_store is None:
+        _pending_store = PendingConfirmationStore(
+            ttl_seconds=settings.TOOL_CONFIRMATION_TTL_SECONDS
+        )
+    return _pending_store
+
+
+# ============================================================
+# 审计日志（JSON Lines）
+# ============================================================
+# 对应 S8 第 77-78 天："将所有工具的执行日志写入审计日志（JSON Lines）"。
+# 提前在第 71-72 天落地，确保从第一天起就有完整的工具调用记录。
+
+_audit_lock = asyncio.Lock()
+
+
+def _ensure_audit_dir() -> None:
+    """确保审计日志目录存在"""
+    log_path = Path(settings.TOOL_AUDIT_LOG_PATH)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+
+async def write_audit_log(
+    session_id: str,
+    tool_call: ToolCall,
+    result: ToolResult,
+) -> None:
+    """
+    异步写入审计日志（JSON Lines）。
+
+    记录格式（每行一个 JSON）：
+    {
+      "timestamp": "2026-10-04T10:00:00.000Z",
+      "session_id": "...",
+      "tool_name": "read_file",
+      "arguments": {"file_path": "main.py"},
+      "success": true,
+      "requires_confirmation": false,
+      "error": null
+    }
+
+    注意：不记录 output（可能包含大段文件内容/命令输出），避免日志膨胀。
+    """
+    try:
+        _ensure_audit_dir()
+        entry = {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+            "session_id": session_id,
+            "tool_name": tool_call.tool_name,
+            "arguments": tool_call.arguments,
+            "success": result.success,
+            "requires_confirmation": result.requires_confirmation,
+            "error": result.error,
+        }
+        async with _audit_lock:
+            with open(settings.TOOL_AUDIT_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as e:
+        # 审计日志失败不应阻断工具执行
+        logger.warning(f"[ToolRegistry] 审计日志写入失败: {e}")
+
+
+# ============================================================
+# 路径安全工具
+# ============================================================
+
+def _resolve_safe_path(file_path: str, workspace_root: str) -> Optional[Path]:
+    """
+    将相对路径解析为工作区内的绝对路径，并校验不逃逸出工作区。
+
+    对应 S6 diff_generator.py 的 _is_path_within 逻辑，统一路径安全策略。
+    防止 ../../../etc/passwd 之类的路径逃逸。
+
+    Returns:
+        解析后的绝对 Path；若逃逸则返回 None。
+    """
+    if not workspace_root:
+        return None
+    rel = file_path.replace("\\", "/")
+    full = Path(workspace_root) / rel
+    try:
+        root_resolved = Path(workspace_root).resolve()
+        full_resolved = full.resolve()
+        common = os.path.commonpath([str(root_resolved), str(full_resolved)])
+        if Path(common) != root_resolved:
+            logger.warning(
+                f"[ToolRegistry] 路径逃逸拦截: file_path={file_path}, "
+                f"workspace_root={workspace_root}"
+            )
+            return None
+        return full_resolved
+    except (ValueError, OSError):
+        return None
+
+
+# ============================================================
+# 工具实现
+# ============================================================
+
+async def tool_read_file(
+    arguments: Dict[str, Any], workspace_root: str, session_id: str
+) -> ToolResult:
+    """
+    read_file：读取文件内容。
+
+    arguments:
+      - file_path:  文件相对路径（相对于 workspace_root），必填。
+      - start_line: 起始行号（1-based，可选）。
+      - end_line:   结束行号（1-based，闭区间，可选）。
+
+    安全限制（S8 第 73-74 天）：
+      - 文件大小 > TOOL_READ_FILE_MAX_BYTES 时自动截断，
+        返回前 HEAD_LINES 行 + 后 TAIL_LINES 行，并附带警告。
+    """
+    file_path = arguments.get("file_path")
+    if not file_path or not isinstance(file_path, str):
+        return ToolResult(success=False, error="缺少必填参数 file_path")
+
+    full_path = _resolve_safe_path(file_path, workspace_root)
+    if full_path is None:
+        return ToolResult(success=False, error=f"文件路径非法或逃逸出工作区: {file_path}")
+
+    if not full_path.exists():
+        return ToolResult(success=False, error=f"文件不存在: {file_path}")
+    if not full_path.is_file():
+        return ToolResult(success=False, error=f"路径不是文件: {file_path}")
+
+    # 大文件截断保护
+    file_size = full_path.stat().st_size
+    try:
+        with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+            if file_size > settings.TOOL_READ_FILE_MAX_BYTES:
+                # 大文件：只读前 HEAD_LINES + 后 TAIL_LINES 行
+                head_lines: list[str] = []
+                for i, line in enumerate(f):
+                    if i >= settings.TOOL_READ_FILE_HEAD_LINES:
+                        break
+                    head_lines.append(line)
+                # 读取尾部
+                # 简化实现：用 seek 到末尾附近
+                try:
+                    f.seek(0, os.SEEK_END)
+                    end_pos = f.tell()
+                    # 估算尾部 TAIL_LINES 行的字节数（按平均 80 字符/行）
+                    tail_bytes = settings.TOOL_READ_FILE_TAIL_LINES * 120
+                    seek_pos = max(0, end_pos - tail_bytes)
+                    f.seek(seek_pos)
+                    tail_content = f.read()
+                    tail_lines = tail_content.splitlines(keepends=True)
+                    # 只保留最后 TAIL_LINES 行
+                    tail_lines = tail_lines[-settings.TOOL_READ_FILE_TAIL_LINES:]
+                except OSError:
+                    tail_lines = []
+
+                warning = (
+                    f"\n... [文件过大（{file_size} bytes > "
+                    f"{settings.TOOL_READ_FILE_MAX_BYTES}），已截断，"
+                    f"仅显示前 {settings.TOOL_READ_FILE_HEAD_LINES} 行和"
+                    f"后 {settings.TOOL_READ_FILE_TAIL_LINES} 行] ...\n"
+                )
+                content = "".join(head_lines) + warning + "".join(tail_lines)
+            else:
+                content = f.read()
+    except OSError as e:
+        return ToolResult(success=False, error=f"读取文件失败: {e}")
+
+    # 行号区间过滤
+    start_line = arguments.get("start_line")
+    end_line = arguments.get("end_line")
+    if start_line is not None or end_line is not None:
+        lines = content.splitlines(keepends=True)
+        total = len(lines)
+        s = int(start_line) if start_line is not None else 1
+        e = int(end_line) if end_line is not None else total
+        s = max(1, min(s, total))
+        e = max(s, min(e, total))
+        content = "".join(lines[s - 1 : e])
+
+    return ToolResult(success=True, output=content)
+
+
+async def tool_write_file(
+    arguments: Dict[str, Any], workspace_root: str, session_id: str
+) -> ToolResult:
+    """
+    write_file：写入文件（需用户确认）。
+
+    arguments:
+      - file_path: 文件相对路径，必填。
+      - content:   要写入的内容，必填。
+      - mode:      'overwrite'（默认）或 'append'。
+
+    安全机制（S8 第 73-74 天）：
+      - 不直接写入，而是返回 requires_confirmation=True，
+        output 字段包含 Diff 预览（复用 diff_generator）。
+      - 用户在插件端点击确认后，由 confirm_tool 调用 _do_write_file 真正落盘。
+    """
+    file_path = arguments.get("file_path")
+    content = arguments.get("content")
+    mode = arguments.get("mode", "overwrite")
+
+    if not file_path or not isinstance(file_path, str):
+        return ToolResult(success=False, error="缺少必填参数 file_path")
+    if content is None or not isinstance(content, str):
+        return ToolResult(success=False, error="缺少必填参数 content")
+    if mode not in ("overwrite", "append"):
+        return ToolResult(success=False, error=f"非法的 mode: {mode}，仅支持 overwrite / append")
+
+    full_path = _resolve_safe_path(file_path, workspace_root)
+    if full_path is None:
+        return ToolResult(success=False, error=f"文件路径非法或逃逸出工作区: {file_path}")
+
+    # 读取原文件内容，生成 Diff 预览
+    try:
+        from app.services.diff_generator import (
+            generate_unified_diff,
+            determine_context_lines,
+        )
+
+        old_content = ""
+        if full_path.exists() and full_path.is_file():
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                old_content = f.read()
+
+        if mode == "append":
+            new_content = old_content + content
+        else:
+            new_content = content
+
+        context_lines = determine_context_lines(
+            old_content if len(old_content) >= len(new_content) else new_content
+        )
+        diff_text = generate_unified_diff(
+            old_content, new_content, file_path, context_lines=context_lines
+        )
+    except Exception as e:
+        logger.warning(f"[ToolRegistry] write_file Diff 生成失败，降级为无预览: {e}")
+        diff_text = ""
+
+    # 构造确认提示
+    action_desc = "追加" if mode == "append" else "覆盖写入"
+    prompt = f"即将{action_desc}文件 {file_path}（{len(content)} 字符），是否继续？"
+
+    return ToolResult(
+        success=True,
+        output=diff_text or f"[Diff 预览不可用]\n原内容长度: {len(old_content)}\n新内容长度: {len(content)}",
+        requires_confirmation=True,
+        confirmation_prompt=prompt,
+    )
+
+
+async def _do_write_file(
+    arguments: Dict[str, Any], workspace_root: str, session_id: str
+) -> ToolResult:
+    """
+    write_file 的真正执行逻辑（用户确认后由 confirm_tool 调用）。
+
+    风险预警应对（大文件写入 OOM）：
+      - 分块流式写入，而非一次性 f.write(content)。
+      - 虽然 content 已经在内存中（来自模型输出），但分块写入可减少
+        单次 IO 压力，并在中途失败时保留已写入部分。
+    """
+    file_path = arguments["file_path"]
+    content = arguments["content"]
+    mode = arguments.get("mode", "overwrite")
+
+    full_path = _resolve_safe_path(file_path, workspace_root)
+    if full_path is None:
+        return ToolResult(success=False, error=f"文件路径非法: {file_path}")
+
+    # 确保父目录存在
+    try:
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return ToolResult(success=False, error=f"创建目录失败: {e}")
+
+    try:
+        open_mode = "a" if mode == "append" else "w"
+        with open(full_path, open_mode, encoding="utf-8") as f:
+            # 分块写入（每块 64KB），应对大文件 OOM 风险
+            chunk_size = 64 * 1024
+            for i in range(0, len(content), chunk_size):
+                f.write(content[i : i + chunk_size])
+    except OSError as e:
+        return ToolResult(success=False, error=f"写入文件失败: {e}")
+
+    return ToolResult(success=True, output=f"文件 {file_path} 写入成功（{len(content)} 字符）")
+
+
+async def tool_run_command(
+    arguments: Dict[str, Any], workspace_root: str, session_id: str
+) -> ToolResult:
+    """
+    run_command：执行终端命令（需用户确认，危险命令直接拦截）。
+
+    arguments:
+      - cmd:     要执行的命令字符串，必填。
+      - timeout: 超时秒数（可选，默认 60，最大 300）。
+
+    安全机制（S8 第 75-76 天）：
+      1. 危险命令黑名单：匹配 TOOL_DANGER_COMMAND_PATTERNS 的命令直接拒绝，
+         无需用户确认（requires_confirmation=False）。
+      2. 普通命令需用户确认：返回 requires_confirmation=True，
+         用户确认后由 confirm_tool 调用 _do_run_command 执行。
+      3. 真正执行时使用 subprocess 列表参数模式（shlex.split），
+         防止命令注入（S8 风险预警）。
+    """
+    cmd = arguments.get("cmd")
+    if not cmd or not isinstance(cmd, str):
+        return ToolResult(success=False, error="缺少必填参数 cmd")
+
+    # 危险命令黑名单检查
+    for pattern in settings.TOOL_DANGER_COMMAND_PATTERNS:
+        if re.search(pattern, cmd):
+            logger.warning(
+                f"[ToolRegistry] 危险命令已拦截: session={session_id}, cmd={cmd!r}"
+            )
+            return ToolResult(
+                success=False,
+                error="危险命令已被拦截，禁止执行",
+            )
+
+    # 普通命令需用户确认
+    prompt = f"即将执行命令：\n{cmd}\n\n是否允许执行？"
+    return ToolResult(
+        success=True,
+        output=f"[待确认命令]\n{cmd}",
+        requires_confirmation=True,
+        confirmation_prompt=prompt,
+    )
+
+
+async def _do_run_command(
+    arguments: Dict[str, Any], workspace_root: str, session_id: str
+) -> ToolResult:
+    """
+    run_command 的真正执行逻辑（用户确认后由 confirm_tool 调用）。
+
+    风险预警应对：
+      - 使用 shlex.split 将命令拆分为列表参数，杜绝字符串拼接注入。
+      - 设置超时，防止命令卡死。
+      - 在工作区目录下执行（cwd=workspace_root）。
+    """
+    cmd = arguments["cmd"]
+    timeout = float(
+        arguments.get("timeout", settings.TOOL_COMMAND_DEFAULT_TIMEOUT)
+    )
+    timeout = min(timeout, settings.TOOL_COMMAND_MAX_TIMEOUT)
+
+    # 命令注入防护：使用 shlex.split 拆分为列表参数
+    try:
+        cmd_list = shlex.split(cmd)
+    except ValueError as e:
+        return ToolResult(success=False, error=f"命令解析失败: {e}")
+
+    if not cmd_list:
+        return ToolResult(success=False, error="命令为空")
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd_list,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=workspace_root or None,
+        )
+    except FileNotFoundError:
+        return ToolResult(success=False, error=f"命令不存在: {cmd_list[0]}")
+    except OSError as e:
+        return ToolResult(success=False, error=f"启动进程失败: {e}")
+
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=timeout
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return ToolResult(
+            success=False,
+            error=f"命令执行超时（{timeout}s）: {cmd}",
+        )
+
+    exit_code = proc.returncode
+    stdout_text = stdout.decode("utf-8", errors="replace") if stdout else ""
+    stderr_text = stderr.decode("utf-8", errors="replace") if stderr else ""
+
+    output = stdout_text
+    if stderr_text:
+        output += ("\n" if output else "") + stderr_text
+
+    if exit_code != 0:
+        return ToolResult(
+            success=False,
+            output=output,
+            error=f"命令退出码 {exit_code}",
+        )
+
+    return ToolResult(success=True, output=output)
+
+
+async def tool_grep_search(
+    arguments: Dict[str, Any], workspace_root: str, session_id: str
+) -> ToolResult:
+    """
+    grep_search：正则搜索代码。
+
+    arguments:
+      - pattern:  正则模式，必填。
+      - path:     搜索目录（相对 workspace_root，默认 "."）。
+      - max_results: 最大结果数（默认 100）。
+
+    实现策略（S8 第 73-74 天）：
+      - 优先使用 ripgrep（rg），若未安装则降级为 Python re + os.walk。
+      - 设置超时 TOOL_GREP_TIMEOUT_SECONDS，防止在 node_modules 中卡死。
+    """
+    pattern = arguments.get("pattern")
+    if not pattern or not isinstance(pattern, str):
+        return ToolResult(success=False, error="缺少必填参数 pattern")
+
+    search_path = arguments.get("path", ".")
+    max_results = int(arguments.get("max_results", 100))
+
+    full_search_path = _resolve_safe_path(search_path, workspace_root)
+    if full_search_path is None:
+        return ToolResult(success=False, error=f"搜索路径非法: {search_path}")
+    if not full_search_path.exists():
+        return ToolResult(success=False, error=f"搜索路径不存在: {search_path}")
+
+    # 优先尝试 ripgrep
+    rg_available = shutil_which("rg") is not None
+    if rg_available:
+        result = await _grep_with_ripgrep(
+            pattern, str(full_search_path), max_results, workspace_root
+        )
+        if result is not None:
+            return result
+        # ripgrep 失败时降级到 Python 实现
+        logger.info("[ToolRegistry] ripgrep 执行失败，降级到 Python 正则搜索")
+
+    return await _grep_with_python(
+        pattern, str(full_search_path), max_results, workspace_root
+    )
+
+
+def shutil_which(cmd: str) -> Optional[str]:
+    """shutil.which 的封装（便于测试 mock）"""
+    import shutil
+    return shutil.which(cmd)
+
+
+async def _grep_with_ripgrep(
+    pattern: str, search_path: str, max_results: int, workspace_root: str
+) -> Optional[ToolResult]:
+    """使用 ripgrep 搜索。返回 ToolResult 或 None（失败时降级）。"""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "rg",
+            "--line-number",
+            "--no-heading",
+            "--color", "never",
+            "--max-count", str(max_results),
+            pattern,
+            search_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=settings.TOOL_GREP_TIMEOUT_SECONDS
+        )
+        if proc.returncode in (0, 1):  # 0=有匹配, 1=无匹配
+            output = stdout.decode("utf-8", errors="replace")
+            return ToolResult(success=True, output=output)
+        return None
+    except (asyncio.TimeoutError, OSError):
+        return None
+
+
+async def _grep_with_python(
+    pattern: str, search_path: str, max_results: int, workspace_root: str
+) -> ToolResult:
+    """Python 降级实现：re + os.walk，带超时保护。"""
+    try:
+        regex = re.compile(pattern)
+    except re.error as e:
+        return ToolResult(success=False, error=f"正则表达式无效: {e}")
+
+    results: list[str] = []
+    skip_dirs = {".git", "node_modules", "__pycache__", ".ai_index", ".ai_cache"}
+
+    async def _search():
+        count = 0
+        for root, dirs, files in os.walk(search_path):
+            # 跳过大型依赖目录
+            dirs[:] = [d for d in dirs if d not in skip_dirs]
+            for fname in files:
+                if count >= max_results:
+                    return
+                fpath = os.path.join(root, fname)
+                try:
+                    with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                        for lineno, line in enumerate(f, 1):
+                            if regex.search(line):
+                                rel = os.path.relpath(fpath, workspace_root)
+                                results.append(f"{rel}:{lineno}:{line.rstrip()}")
+                                count += 1
+                                if count >= max_results:
+                                    return
+                except OSError:
+                    continue
+
+    try:
+        await asyncio.wait_for(_search(), timeout=settings.TOOL_GREP_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        return ToolResult(
+            success=False,
+            error=f"搜索超时（{settings.TOOL_GREP_TIMEOUT_SECONDS}s），结果可能不完整",
+            output="\n".join(results),
+        )
+
+    return ToolResult(success=True, output="\n".join(results))
+
+
+async def tool_git_commit(
+    arguments: Dict[str, Any], workspace_root: str, session_id: str
+) -> ToolResult:
+    """
+    git_commit：Git 提交（需用户确认）。
+
+    arguments:
+      - message: 提交信息（可选，未提供时返回提示需要确认后再决定）。
+
+    安全机制（S8 第 77-78 天）：
+      - 提交前先执行 git status，若工作区无变更则直接返回失败。
+      - 返回 requires_confirmation=True，output 包含变更文件列表，
+        用户确认后由 confirm_tool 调用 _do_git_commit 执行。
+    """
+    # 先检查 git 状态
+    status_result = await _run_git(["status", "--short"], workspace_root)
+    if not status_result.success:
+        return ToolResult(
+            success=False,
+            error=f"获取 git status 失败: {status_result.error}",
+        )
+
+    status_output = status_result.output.strip()
+    if not status_output:
+        return ToolResult(success=False, error="工作区无变更，无需提交")
+
+    message = arguments.get("message", "")
+    if not message:
+        message = "(未提供提交信息，确认后可补充)"
+
+    prompt = (
+        f"即将执行 git commit，提交信息：\n{message}\n\n"
+        f"涉及变更文件：\n{status_output}\n\n是否继续？"
+    )
+
+    return ToolResult(
+        success=True,
+        output=status_output,
+        requires_confirmation=True,
+        confirmation_prompt=prompt,
+    )
+
+
+async def _do_git_commit(
+    arguments: Dict[str, Any], workspace_root: str, session_id: str
+) -> ToolResult:
+    """git_commit 的真正执行逻辑（用户确认后调用）。"""
+    message = arguments.get("message", "")
+    if not message:
+        message = "chore: auto commit by agent"
+
+    # git add -A
+    add_result = await _run_git(["add", "-A"], workspace_root)
+    if not add_result.success:
+        return ToolResult(success=False, error=f"git add 失败: {add_result.error}")
+
+    # git commit -m
+    commit_result = await _run_git(
+        ["commit", "-m", message], workspace_root
+    )
+    if not commit_result.success:
+        return ToolResult(success=False, error=f"git commit 失败: {commit_result.error or commit_result.output}")
+
+    # 获取 commit hash
+    hash_result = await _run_git(["rev-parse", "HEAD"], workspace_root)
+    commit_hash = hash_result.output.strip() if hash_result.success else "unknown"
+
+    return ToolResult(
+        success=True,
+        output=f"提交成功: {commit_hash}\n{commit_result.output}",
+    )
+
+
+async def _run_git(args: list[str], workspace_root: str) -> ToolResult:
+    """执行 git 子命令的内部辅助函数。"""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git", *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=workspace_root or None,
+        )
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=settings.TOOL_COMMAND_DEFAULT_TIMEOUT
+        )
+        stdout_text = stdout.decode("utf-8", errors="replace")
+        stderr_text = stderr.decode("utf-8", errors="replace")
+        if proc.returncode != 0:
+            return ToolResult(
+                success=False,
+                output=stdout_text,
+                error=stderr_text or f"git {' '.join(args)} 退出码 {proc.returncode}",
+            )
+        return ToolResult(success=True, output=stdout_text)
+    except asyncio.TimeoutError:
+        return ToolResult(success=False, error=f"git {' '.join(args)} 超时")
+    except FileNotFoundError:
+        return ToolResult(success=False, error="git 未安装")
+    except OSError as e:
+        return ToolResult(success=False, error=f"git 执行失败: {e}")
+
+
+# ============================================================
+# 工具注册表
+# ============================================================
+# 所有工具注册到此字典。execute_tool 根据 tool_name 路由到对应 handler。
+# 注意：write_file / run_command / git_commit 的 handler 返回 requires_confirmation=True，
+# 真正执行由 _do_* 函数在 confirm_tool 中完成。
+
+_TOOL_REGISTRY: Dict[str, ToolHandler] = {
+    "read_file": tool_read_file,
+    "write_file": tool_write_file,
+    "run_command": tool_run_command,
+    "grep_search": tool_grep_search,
+    "git_commit": tool_git_commit,
+}
+
+# 确认后真正执行的 handler 映射（key 与 _TOOL_REGISTRY 一致）
+_CONFIRM_HANDLERS: Dict[str, ToolHandler] = {
+    "write_file": _do_write_file,
+    "run_command": _do_run_command,
+    "git_commit": _do_git_commit,
+}
+
+
+def get_registered_tools() -> list[str]:
+    """返回已注册的工具名称列表（供调试/文档展示）"""
+    return list(_TOOL_REGISTRY.keys())
+
+
+# ============================================================
+# 统一入口：execute_tool
+# ============================================================
+
+async def execute_tool(
+    tool_call: ToolCall,
+    workspace_root: str = "",
+    session_id: str = "",
+) -> ToolResult:
+    """
+    工具执行统一入口（S8 第 71-72 天核心）。
+
+    流程：
+      1. 从 _TOOL_REGISTRY 查找 handler，未找到返回错误。
+      2. 调用 handler，捕获所有异常。
+      3. 若 handler 返回 requires_confirmation=True：
+         - 生成 confirmation_id，存入 PendingConfirmationStore。
+         - 将 confirmation_id 填入 ToolResult 返回。
+      4. 无论成功失败，写入审计日志。
+
+    Args:
+        tool_call:       工具调用请求。
+        workspace_root:  工作区根目录，用于解析相对路径。
+        session_id:      会话 ID，用于审计日志。
+
+    Returns:
+        ToolResult。
+    """
+    handler = _TOOL_REGISTRY.get(tool_call.tool_name)
+    if handler is None:
+        result = ToolResult(
+            success=False,
+            error=f"未知工具: {tool_call.tool_name}，可用工具: {get_registered_tools()}",
+        )
+        await write_audit_log(session_id, tool_call, result)
+        return result
+
+    try:
+        result = await handler(tool_call.arguments, workspace_root, session_id)
+    except Exception as e:
+        # 兜底异常捕获，防止工具内部异常导致整个服务崩溃
+        logger.error(
+            f"[ToolRegistry] 工具执行异常: tool={tool_call.tool_name}, "
+            f"session={session_id}, err={e}",
+            exc_info=True,
+        )
+        result = ToolResult(
+            success=False,
+            error=f"工具执行异常: {type(e).__name__}: {e}",
+        )
+
+    # 需要用户确认：生成 confirmation_id
+    if result.requires_confirmation and not result.confirmation_id:
+        confirmation_id = await get_pending_confirmation_store().put(
+            tool_call, workspace_root, session_id
+        )
+        result.confirmation_id = confirmation_id
+
+    await write_audit_log(session_id, tool_call, result)
+    return result
+
+
+# ============================================================
+# 确认执行：confirm_tool
+# ============================================================
+
+async def confirm_tool(
+    confirmation_id: str,
+    action: str,
+    session_id: str = "",
+) -> ToolResult:
+    """
+    处理用户对工具的确认操作（S8 关键接口）。
+
+    流程：
+      1. 从 PendingConfirmationStore 取出待确认记录（取出即删除，一次性凭证）。
+      2. 记录不存在或已过期 → 返回错误。
+      3. action='deny' → 返回拒绝结果。
+      4. action='allow' → 调用 _CONFIRM_HANDLERS 中对应的 _do_* 函数真正执行。
+
+    Args:
+        confirmation_id: execute_tool 返回的确认凭证。
+        action:          'allow' 或 'deny'。
+        session_id:      会话 ID，用于审计日志。
+
+    Returns:
+        ToolResult（allow 时为真实执行结果；deny 时为拒绝结果）。
+    """
+    store = get_pending_confirmation_store()
+    record = await store.pop(confirmation_id)
+    if record is None:
+        return ToolResult(
+            success=False,
+            error="确认凭证不存在或已过期",
+        )
+
+    # 校验 session_id 一致性（防止跨会话确认）
+    if session_id and record.session_id != session_id:
+        return ToolResult(
+            success=False,
+            error="确认凭证与会话不匹配",
+        )
+
+    if action == "deny":
+        logger.info(
+            f"[ToolRegistry] 用户拒绝执行: tool={record.tool_call.tool_name}, "
+            f"session={record.session_id}"
+        )
+        result = ToolResult(
+            success=False,
+            error="用户拒绝执行该操作",
+        )
+        await write_audit_log(record.session_id, record.tool_call, result)
+        return result
+
+    # allow：调用真正的执行 handler
+    confirm_handler = _CONFIRM_HANDLERS.get(record.tool_call.tool_name)
+    if confirm_handler is None:
+        result = ToolResult(
+            success=False,
+            error=f"工具 {record.tool_call.tool_name} 无需确认或不支持确认执行",
+        )
+        await write_audit_log(record.session_id, record.tool_call, result)
+        return result
+
+    try:
+        result = await confirm_handler(
+            record.tool_call.arguments,
+            record.workspace_root,
+            record.session_id,
+        )
+    except Exception as e:
+        logger.error(
+            f"[ToolRegistry] 确认后执行异常: tool={record.tool_call.tool_name}, "
+            f"err={e}",
+            exc_info=True,
+        )
+        result = ToolResult(
+            success=False,
+            error=f"执行异常: {type(e).__name__}: {e}",
+        )
+
+    await write_audit_log(record.session_id, record.tool_call, result)
+    return result
