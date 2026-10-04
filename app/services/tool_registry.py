@@ -449,11 +449,16 @@ async def tool_run_command(
     安全机制（S8 第 75-76 天）：
       1. 危险命令黑名单：匹配 TOOL_DANGER_COMMAND_PATTERNS 的命令直接拒绝，
          无需用户确认（requires_confirmation=False）。
-      2. 普通命令需用户确认：返回 requires_confirmation=True，
+      2. **交互式命令检测（S8 风险预警：终端命令的交互式输入）**：
+         命中 is_interactive_command() 的命令（npm init 无 --yes / python REPL
+         / ssh / mysql -p 等）返回 requires_interaction=True，由插件提示用户
+         在真实终端手动执行后告知 Agent 继续。Agent 自动执行会卡死。
+      3. 普通命令需用户确认：返回 requires_confirmation=True，
          用户确认后由 confirm_tool 调用 _do_run_command 执行。
-      3. 真正执行时使用 subprocess 列表参数模式（shlex.split），
-         防止命令注入（S8 风险预警）。
+      4. 真正执行时委托给 CommandExecutor（独立进程组 + 流式输出）。
     """
+    from app.services.command_executor import is_interactive_command
+
     cmd = arguments.get("cmd")
     if not cmd or not isinstance(cmd, str):
         return ToolResult(success=False, error="缺少必填参数 cmd")
@@ -468,6 +473,22 @@ async def tool_run_command(
                 success=False,
                 error="危险命令已被拦截，禁止执行",
             )
+
+    # 交互式命令检测（S8 风险预警：终端命令的交互式输入）
+    # 命中后不弹确认框，直接返回 requires_interaction=True
+    if is_interactive_command(cmd):
+        logger.info(
+            f"[ToolRegistry] 检测到交互式命令，需用户手动执行: "
+            f"session={session_id}, cmd={cmd!r}"
+        )
+        return ToolResult(
+            success=False,
+            output=f"[需要交互式输入] {cmd}",
+            error="命令需要交互式输入（如密码、选项确认等），Agent 自动执行会卡死。"
+                  "请在真实终端手动执行后告知 Agent 继续，或在命令中追加非交互参数"
+                  "（如 npm init --yes、python -c \"code\"）。",
+            requires_interaction=True,
+        )
 
     # 普通命令需用户确认
     prompt = f"即将执行命令：\n{cmd}\n\n是否允许执行？"
@@ -485,53 +506,55 @@ async def _do_run_command(
     """
     run_command 的真正执行逻辑（用户确认后由 confirm_tool 调用）。
 
+    S8 第 75-76 天：委托给 CommandExecutor 实现：
+      - 流式输出：stdout/stderr 通过 CommandStreamManager 实时推送
+        给 WebSocket 订阅者（/v1/agent/stream/{session_id}）。
+      - 进程组隔离：start_new_session / CREATE_NEW_PROCESS_GROUP，
+        方便 SIGTERM 杀死整个进程组。
+      - 命令注入防护：shlex.split 列表参数模式。
+
     风险预警应对：
-      - 使用 shlex.split 将命令拆分为列表参数，杜绝字符串拼接注入。
-      - 设置超时，防止命令卡死。
-      - 在工作区目录下执行（cwd=workspace_root）。
+      - 交互式命令二次检测（安全网，防止绕过 tool_run_command 直接调用 confirm）。
+      - 超时杀进程：先 SIGTERM 后 SIGKILL（在 CommandExecutor._kill_process_group）。
     """
+    from app.services.command_executor import (
+        CommandExecutor,
+        get_command_executor,
+        is_interactive_command,
+    )
+
     cmd = arguments["cmd"]
     timeout = float(
         arguments.get("timeout", settings.TOOL_COMMAND_DEFAULT_TIMEOUT)
     )
     timeout = min(timeout, settings.TOOL_COMMAND_MAX_TIMEOUT)
 
-    # 命令注入防护：使用 shlex.split 拆分为列表参数
-    try:
-        cmd_list = shlex.split(cmd)
-    except ValueError as e:
-        return ToolResult(success=False, error=f"命令解析失败: {e}")
-
-    if not cmd_list:
-        return ToolResult(success=False, error="命令为空")
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd_list,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=workspace_root or None,
+    # 交互式命令二次检测（安全网）
+    if is_interactive_command(cmd):
+        logger.warning(
+            f"[ToolRegistry] 确认阶段检测到交互式命令，已阻止执行: "
+            f"session={session_id}, cmd={cmd!r}"
         )
-    except FileNotFoundError:
-        return ToolResult(success=False, error=f"命令不存在: {cmd_list[0]}")
-    except OSError as e:
-        return ToolResult(success=False, error=f"启动进程失败: {e}")
-
-    try:
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=timeout
-        )
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
         return ToolResult(
             success=False,
-            error=f"命令执行超时（{timeout}s）: {cmd}",
+            error="命令需要交互式输入，请在真实终端手动执行",
+            requires_interaction=True,
         )
 
-    exit_code = proc.returncode
-    stdout_text = stdout.decode("utf-8", errors="replace") if stdout else ""
-    stderr_text = stderr.decode("utf-8", errors="replace") if stderr else ""
+    executor = get_command_executor()
+    try:
+        exit_code, stdout_text, stderr_text = await executor.execute(
+            cmd=cmd,
+            workspace_root=workspace_root,
+            session_id=session_id,
+            timeout=timeout,
+        )
+    except FileNotFoundError as e:
+        return ToolResult(success=False, error=str(e))
+    except ValueError as e:
+        return ToolResult(success=False, error=str(e))
+    except OSError as e:
+        return ToolResult(success=False, error=str(e))
 
     output = stdout_text
     if stderr_text:

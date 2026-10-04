@@ -30,6 +30,7 @@ from app.api.symbols import router as symbols_router
 from app.api.cue import router as cue_router
 from app.api.agent import router as agent_router
 from app.api.tool import router as tool_router
+from app.api.stream import router as stream_router
 
 # 日志配置必须在所有日志调用之前执行
 setup_logging()
@@ -110,6 +111,10 @@ def create_app() -> FastAPI:
     app.include_router(agent_router, prefix="/v1/agent", tags=["Agent"])
     # S8 第 71-72 天：工具执行与确认接口（MCP 协议适配层）
     app.include_router(tool_router, prefix="/v1/tool", tags=["工具执行"])
+    # S8 第 75-76 天：终端日志流式接口（WebSocket）
+    # 路径前缀 /v1，使最终 URL 为 /v1/agent/stream/{session_id}，
+    # 与 Sprint_8.md 关键接口定义一致。
+    app.include_router(stream_router, prefix="/v1", tags=["流式日志"])
 
     # 基础路由
     @app.get("/", tags=["默认"])

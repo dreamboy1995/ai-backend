@@ -85,7 +85,7 @@ _REASON_SYSTEM_PROMPT_TEMPLATE = """你是一个专业的开发 Agent，正在�
 **已完成步骤的上下文（摘要）**：
 {context}
 
-请决定这一步要调用的工具及其参数。你必须返回一个严格的 JSON 对象，不要任何解释、问候语或 markdown 代码围栏标记：
+请决定这一步要调用的工具及其参数。你必须返回**且只返回一个**严格的 JSON 对象，不要任何解释、问候语或 markdown 代码围栏标记：
 {{
   "tool": "工具名称",
   "params": {{...}}
@@ -102,12 +102,13 @@ _REASON_SYSTEM_PROMPT_TEMPLATE = """你是一个专业的开发 Agent，正在�
 2. 即使「建议工具」不是 ask_user，但只要本步骤涉及技术选型 / 架构决策 / 外部依赖选择 / 配置参数，且存在两个及以上合理方案，也**必须**返回 ask_user。
 3. 只有在明确无选型空间的纯执行步骤，才返回 write_file / run_command / search_code。
 4. ask_user 的 question 应当给出可选方案供用户选择（例如："使用 SQLite 还是 PostgreSQL？"）。
+5. **每次只能返回一个 JSON 对象**。即使一个步骤需要写多个文件或执行多条命令，也必须选择最合适的那一个先返回；后续操作会在下一个步骤中继续。**严禁输出两个或多个连续的 JSON 对象**。
 
 **示例**：
 - 步骤"选择数据库方案"，建议工具 ask_user → 返回 {{"tool": "ask_user", "params": {{"question": "使用 SQLite 还是 PostgreSQL？"}}}}
 - 步骤"实现后端 API"，建议工具 write_file，无选型 → 返回 {{"tool": "write_file", "params": {{"path": "...", "content": "..."}}}}
 
-只返回 JSON 对象本身。
+只返回一个 JSON 对象本身。
 """
 
 
@@ -179,30 +180,77 @@ def _build_reason_messages(
     ]
 
 
+def _find_first_json_object(text: str) -> Optional[str]:
+    """
+    使用括号深度跟踪，从文本中定位第一个完整的 JSON 对象（{ ... }）。
+
+    处理 LLM 返回多个连续 JSON 对象的场景（如同时想写两个文件时输出
+    {json1}\\n\\n{json2}），避免 rfind('}') 把所有对象都吞进去导致
+    json.loads 报 "Extra data" 错误。
+
+    Returns:
+        第一个完整 JSON 对象的子串（不含周围文本），找不到则返回 None。
+    """
+    start = text.find("{")
+    if start == -1:
+        return None
+
+    depth = 0
+    in_string = False
+    escape = False
+
+    for i in range(start, len(text)):
+        ch = text[i]
+
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+
+    return None  # 括号未闭合
+
+
 def _extract_action_json(text: str) -> Optional[Dict[str, Any]]:
     """
     从 Reason 阶段模型输出中提取 action JSON。
 
     应对 S7 风险预警：模型即使加了 response_format=json_object，
-    有时仍会在 JSON 前后加 ```json 标记或解释文字。
-    用正则提取第一个 { 到最后一个 } 之间的内容并解析。
+    有时仍会在 JSON 前后加 ```json 标记或解释文字，或一次返回
+    多个连续 JSON 对象。
 
     额外的鲁棒性处理：
       - 去除 markdown 代码围栏
+      - 只取第一个完整 JSON 对象（括号深度跟踪），忽略后续多余对象
       - 移除对象/数组的尾随逗号（模型常见错误）
-      - 清理不可见控制字符（保留 \n \r \t）
+      - 清理不可见控制字符（保留 \\n \\r \\t）
 
     返回 {"tool": "...", "params": {...}} 或 None（解析失败）。
     """
     if not text:
         return None
+
     # 去除 markdown 代码围栏
     text = re.sub(r"```(?:json)?", "", text, flags=re.IGNORECASE).strip()
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
+
+    # 用括号深度跟踪定位第一个完整 JSON 对象
+    json_str = _find_first_json_object(text)
+    if json_str is None:
+        logger.warning("[ReAct] Reason 输出中未找到合法 JSON 对象")
         return None
-    json_str = text[start : end + 1]
 
     # 规范化 1：移除尾随逗号（,} 或 ,]），模型常见输出错误
     json_str = re.sub(r",(\s*[}\]])", r"\1", json_str)
@@ -235,6 +283,8 @@ _REASON_RETRY_INSTRUCTION = (
     "不要任何解释、问候语或 markdown 代码围栏标记。"
     "如果 content 字段包含代码，其中的双引号必须转义为 \\\"，换行必须转义为 \\n。"
     "JSON 格式：{\"tool\": \"工具名称\", \"params\": {...}}"
+    "重要：一次只能输出一个 JSON 对象，严禁输出两个或多个连续的 JSON 对象。"
+    "如果有多个操作要做，选一个最重要的先返回，后续操作会在下一步继续。"
 )
 
 

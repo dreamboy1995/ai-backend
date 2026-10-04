@@ -63,6 +63,10 @@ class ToolResult(BaseModel):
     - confirmation_prompt: 确认框展示给用户的提示文本（如 "即将写入文件 main.py，是否继续？"）。
     - confirmation_id:     后端生成的确认凭证，用户确认时需原样回传。
                   仅当 requires_confirmation=True 时有值。
+    - requires_interaction: S8 第 75-76 天新增。True 表示命令需要交互式输入
+                  （如 npm init 无 --yes、python REPL 等），Agent 自动执行会卡住。
+                  此时由插件提示用户在真实终端手动完成，再告知 Agent 继续。
+                  对应 S8 风险预警："终端命令的交互式输入"。
     """
 
     success: bool
@@ -71,6 +75,33 @@ class ToolResult(BaseModel):
     requires_confirmation: bool = False
     confirmation_prompt: Optional[str] = None
     confirmation_id: Optional[str] = None
+    requires_interaction: bool = False
+
+
+# ============================================================
+# 终端日志流式消息（S8 第 75-76 天）
+# ============================================================
+# 对应 Sprint_8.md「关键接口/数据结构变更」：
+#   ws://localhost:3000/v1/agent/stream/{session_id}
+#   interface StreamMessage {
+#     type: 'stdout' | 'stderr' | 'system';
+#     content: string;  // 可能包含 ANSI 颜色码
+#     timestamp: string;
+#   }
+#
+# - stdout/stderr: 命令进程的实时输出（按行推送，可能含 ANSI 颜色码）
+# - system:        系统事件（启动提示、退出码、超时杀进程等元信息）
+# - timestamp:     ISO 8601 UTC 时间戳，便于插件端按时间排序
+
+StreamMessageType = Literal["stdout", "stderr", "system"]
+
+
+class StreamMessage(BaseModel):
+    """终端日志流式消息（通过 WebSocket 推送给插件端）"""
+
+    type: StreamMessageType = Field(..., description="消息类型：stdout/stderr/system")
+    content: str = Field(..., description="输出内容，可能包含 ANSI 颜色码")
+    timestamp: str = Field(..., description="ISO 8601 UTC 时间戳")
 
 
 # ============================================================

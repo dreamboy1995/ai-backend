@@ -110,6 +110,19 @@ class MCPToolExecutor(ToolExecutor):
             session_id=self.session_id,
         )
 
+        # S8 第 75-76 天：交互式命令检测（必须在 success 检查之前）
+        # requires_interaction=True 表示命令需要用户在真实终端手动执行，
+        # Agent 自动执行会卡死。返回提示文本，让 Agent 知道应告知用户。
+        if result.requires_interaction:
+            obs = (
+                f"[需要交互式输入] {result.error or result.output or ''}\n"
+                "请在真实终端手动执行后告知继续。"
+            )
+            logger.info(
+                f"[MCPToolExecutor] 命令需要交互式输入: tool={tool}"
+            )
+            return obs
+
         if not result.success:
             # 失败：抛出 ToolExecutionError，让 react_loop 标记步骤 failed
             raise ToolExecutionError(result.error or "工具执行失败")
