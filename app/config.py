@@ -379,6 +379,34 @@ class Settings(BaseSettings):
 - run_command 的 cmd 字段可以使用 cd / workdir 来定位路径，但不能假设 workdir 是什么
 - 确保修复后不会引入新的错误
 """
+    # ============================================================
+    # S9 第 85-86 天：测试沙箱集成配置
+    # ============================================================
+    # 是否启用测试自动检测与执行（全局开关）。
+    # self_repair 循环在代码修改后会自动触发 run_tests，关闭则跳过。
+    TEST_RUNNER_ENABLED: bool = True
+    # run_tests 默认超时（秒）。超过后主动中止，防止卡死。
+    # 对应 S9 风险预警："超时保护：如果项目测试套件执行时间过长（如超过 30 秒），
+    # Agent 应主动中止 run_tests，并提示用户'测试执行时间过长，请手动检查'"
+    TEST_RUNNER_DEFAULT_TIMEOUT: float = 30.0
+    # run_tests 最大超时（秒）。硬上限，防止用户传入过大值。
+    TEST_RUNNER_MAX_TIMEOUT: float = 120.0
+    # 是否允许 run_tests 自动安装项目依赖。
+    # 对应 S9 风险预警："测试套件依赖复杂——有些项目需要先 npm install 才能跑 npm test。
+    # 在 run_tests 工具中，需要先检测 node_modules 或 venv 是否存在，不存在则自动先执行
+    # 依赖安装（npm install / pip install -r requirements.txt）"
+    TEST_RUNNER_AUTO_INSTALL_DEPS: bool = True
+    # 依赖安装超时（秒）。npm install / pip install 通常在 30-60s。
+    TEST_RUNNER_DEPS_INSTALL_TIMEOUT: float = 120.0
+    # 测试结果解析：是否生成结构化 failures 详情。
+    # pytest 使用 --tb=short + --json 插件（若可用），jest 使用 --json。
+    TEST_RUNNER_PARSE_DETAILS: bool = True
+    # 自动检测测试文件时，是否同时检查子目录。
+    # 默认 True：递归查找所有 test_*.py / *.test.js / *.spec.js 文件。
+    TEST_RUNNER_SEARCH_RECURSIVE: bool = True
+    # 自动检测时扫描文件数上限（防止 node_modules / .venv 中扫描过多）。
+    TEST_RUNNER_MAX_SCAN_FILES: int = 500
+
     # 自修复 Prompt（无 file_path 场景——比如 run_command 命令本身错了）
     SELF_REPAIR_PROMPT_NO_FILE: str = """你刚才执行任务时遇到了错误。请分析错误原因并生成修复方案。
 

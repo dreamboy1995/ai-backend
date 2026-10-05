@@ -51,6 +51,140 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
+# S9 第 85-86 天：测试沙箱在自修复中的集成
+# ============================================================
+
+# 缓存标记：项目是否有测试文件（每 session 只检测一次，后续修复循环复用结果）
+_session_has_tests_cache: Dict[str, bool] = {}
+
+
+async def _should_run_tests(session: AgentSession, step: TaskStep) -> bool:
+    """
+    判断本次修复后是否应该自动运行测试。
+
+    条件（全部满足时返回 True）：
+      1. 全局启用测试沙箱（settings.TEST_RUNNER_ENABLED）
+      2. 修复工具是 write_file（代码修改场景）
+      3. 项目中存在测试文件（has_tests_in_project）
+
+    返回 False 时表示跳过 run_tests。
+    """
+    if not settings.TEST_RUNNER_ENABLED:
+        return False
+    # run_command 场景（比如改命令参数）不触发测试
+    # 只有 write_file 代码修改场景才触发
+    repair_tool = None  # caller 会传入
+    # 项目有测试文件检测（带缓存）
+    session_id = session.session_id
+    if session_id not in _session_has_tests_cache:
+        try:
+            from app.services.test_runner import has_tests_in_project
+            _session_has_tests_cache[session_id] = await has_tests_in_project(
+                session.workspace_root
+            )
+            logger.info(
+                f"[SelfRepair] 测试文件检测（首次）: session={session_id}, "
+                f"has_tests={_session_has_tests_cache[session_id]}"
+            )
+        except Exception as e:
+            logger.warning(f"[SelfRepair] 测试文件检测异常，跳过 run_tests: {e}")
+            _session_has_tests_cache[session_id] = False
+            return False
+    return _session_has_tests_cache[session_id]
+
+
+async def _run_tests_after_repair(
+    session: AgentSession,
+    step: TaskStep,
+    attempt: int,
+    max_retries: int,
+) -> Tuple[Optional["ParsedError"], bool]:
+    """
+    修复成功执行后自动运行测试（S9 风险预警：大模型"幻觉修复"的验收裁判）。
+
+    流程：
+      1. 调用 run_tests 运行测试套件。
+      2. 测试通过 → 返回 (None, False)，正常走后续验证流程。
+      3. 测试失败 → 将测试失败信息转为 ParsedError，返回 (parsed_error, True)。
+         调用方将用新的 parsed_error 驱动下一轮修复 Prompt（相当于测试失败
+         也算一种"错误来源"）。
+
+    Returns:
+        (new_parsed_error, tests_failed):
+        - tests_failed=True 表示测试失败，调用方应用新 parsed_error 替换旧的
+        - tests_failed=False 表示测试通过或跳过
+    """
+    from app.services.test_runner import run_tests, TestRunResult, result_to_summary
+
+    logger.info(
+        f"[SelfRepair] 自动触发 run_tests（代码修改后）: "
+        f"step={step.id}, attempt={attempt}/{max_retries}"
+    )
+
+    try:
+        result: TestRunResult = await run_tests(
+            workspace_root=session.workspace_root,
+            session_id=session.session_id,
+        )
+    except Exception as e:
+        logger.warning(
+            f"[SelfRepair] run_tests 执行异常（跳过，非致命）: {e}"
+        )
+        return None, False
+
+    summary = result_to_summary(result)
+    logger.info(
+        f"[SelfRepair] run_tests 结果: passed={result.passed}, "
+        f"failed={result.failed}, errors={result.errors}, summary={summary}"
+    )
+
+    # 测试通过或超时但已有基本通过 → 不干扰自修复流程
+    if result.success:
+        return None, False
+
+    # 超时提示：不强制将超时当作错误来源（测试只是没跑完，不一定真有 bug）
+    if result.timed_out:
+        logger.warning(
+            f"[SelfRepair] 测试执行超时，跳过作为错误来源: {summary}"
+        )
+        return None, False
+
+    # 框架不可用 → 跳过（无法跑测试）
+    if result.framework == "unknown" and result.error_message:
+        logger.warning(
+            f"[SelfRepair] 测试框架不可用，跳过: {result.error_message}"
+        )
+        return None, False
+
+    # 测试失败 → 构造 ParsedError 注入修复循环
+    # 用第一个失败用例的 error 作为核心信息
+    first_failure = result.failures[0] if result.failures else None
+    error_msg_parts = [f"测试失败: {summary}"]
+    if first_failure:
+        error_msg_parts.append(f"首个失败: {first_failure.test_name}")
+        if first_failure.error:
+            error_msg_parts.append(f"错误信息: {first_failure.error}")
+
+    test_error = ParsedError(
+        error_type="TestFailure",
+        error_message="\n".join(error_msg_parts),
+        file_path=first_failure.file if first_failure else None,
+        line_number=first_failure.line if first_failure else None,
+        language="python" if result.framework in ("pytest", "unittest") else "javascript",
+        code_snippet="\n".join(
+            f"- {tf.test_name}: {tf.error[:80]}"
+            for tf in result.failures[:5]
+        ),
+    )
+
+    logger.warning(
+        f"[SelfRepair] 测试失败作为新错误来源: {test_error.error_type}: "
+        f"{test_error.error_message[:200]}"
+    )
+    return test_error, True
+
+
+# ============================================================
 # 工具函数：构建修复 Prompt
 # ============================================================
 
@@ -508,9 +642,39 @@ async def repair_loop(
             result_summary=f"执行 {tool_name} 进行修复",
         )
 
+        # ============================================================
+        # S9 第 85-86 天：测试沙箱自动触发（代码修改后）
+        # ============================================================
+        # 当修复工具是 write_file（代码修改）且项目有测试文件时，
+        # 自动运行测试套件。测试失败作为新的"错误"来源注入下一轮修复 Prompt。
+        # 对应 S9 风险预警："大模型幻觉修复 → 测试是唯一可靠验收裁判"
+        test_error_injected = False
+        if (
+            repair_tool_result
+            and repair_tool_result.success
+            and tool_name == "write_file"
+        ):
+            tests_should_run = await _should_run_tests(session, step)
+            if tests_should_run:
+                new_parsed_err, tests_failed = await _run_tests_after_repair(
+                    session, step, attempt, max_retries
+                )
+                if tests_failed and new_parsed_err is not None:
+                    # 注入测试失败作为新的错误来源
+                    parsed_error = new_parsed_err
+                    last_verify_error = f"测试失败（{new_parsed_err.error_type}）"
+                    test_error_injected = True
+                    ra.result_summary += f" | run_tests 失败"
+                    # 测试失败已经是"错误"了，跳过原始步骤的 verify——
+                    # 直接走下一轮修复，Prompt 用测试失败信息
+                    verify_result = None
+                else:
+                    # 测试通过或跳过，正常继续原始步骤验证
+                    pass
+
         # ---- 验证：重新执行原始失败的步骤 ----
         verify_result: Optional[ToolResult] = None
-        if repair_tool_result and repair_tool_result.success:
+        if not test_error_injected and repair_tool_result and repair_tool_result.success:
             try:
                 verify_result = await tool_executor.execute(
                     step.action,

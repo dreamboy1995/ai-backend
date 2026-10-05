@@ -1275,6 +1275,76 @@ async def _run_git(args: list[str], workspace_root: str) -> ToolResult:
 
 
 # ============================================================
+# S9 第 85-86 天：run_tests 工具（测试沙箱）
+# ============================================================
+
+async def tool_run_tests(
+    arguments: Dict[str, Any], workspace_root: str, session_id: str
+) -> ToolResult:
+    """
+    run_tests：运行项目测试套件（S9 新增工具，Agent 自修复循环自动调用）。
+
+    arguments:
+      - framework: pytest | unittest | jest | npm_test | auto（默认 auto 自动检测）
+      - path:      可选，指定测试文件/目录（相对 workspace_root）
+      - timeout:   可选，测试超时秒数（默认 30，最大 120）
+
+    设计要点：
+      - 无需用户确认（requires_confirmation=False）—— Agent 自修复循环自动调用。
+      - 自动检测项目测试框架（pytest / jest / npm test）。
+      - 自动安装缺失的依赖（pip install / npm install）。
+      - 超时保护（默认 30s），防止卡死。
+      - 结果结构化：output 为 TestRunResult 字典（含 passed/failed/failures 详情）。
+
+    风险预警应对：
+      - 测试套件依赖复杂 → 自动安装依赖（见 test_runner.py）
+      - 超时卡死 → asyncio.wait_for + SandboxOrchestrator 进程组管理
+      - 无测试框架 → 返回友好错误提示，不崩溃
+      - 大模型"幻觉修复" → 测试作为验收裁判，测试不过 = 修复无效
+    """
+    framework = arguments.get("framework", "auto")
+    test_path = arguments.get("path")
+    timeout_val = arguments.get("timeout")
+
+    timeout: Optional[float] = None
+    if timeout_val is not None:
+        try:
+            timeout = float(timeout_val)
+        except (ValueError, TypeError):
+            pass
+
+    from app.services.test_runner import run_tests, result_to_summary
+
+    try:
+        result = await run_tests(
+            workspace_root=workspace_root,
+            framework=str(framework) if framework else None,
+            test_path=str(test_path) if test_path else None,
+            timeout=timeout,
+            session_id=session_id,
+        )
+    except Exception as e:
+        logger.error(f"[ToolRegistry] run_tests 执行异常: {e}", exc_info=True)
+        return ToolResult(
+            success=False,
+            error=f"测试执行异常: {type(e).__name__}: {e}",
+        )
+
+    # 构建 output：结构化 dict（供前端渲染进度条和失败列表）
+    summary = result_to_summary(result)
+    output_dict = result.model_dump()
+
+    return ToolResult(
+        success=result.success,
+        output={
+            "summary": summary,
+            "test_result": output_dict,
+        },
+        error=None if result.success else summary,
+    )
+
+
+# ============================================================
 # S8 第 77-78 天：git_commit 结构化预览辅助函数
 # ============================================================
 
@@ -1374,6 +1444,8 @@ _TOOL_REGISTRY: Dict[str, ToolHandler] = {
     "run_command": tool_run_command,
     "grep_search": tool_grep_search,
     "git_commit": tool_git_commit,
+    # S9 第 85-86 天：run_tests 测试沙箱工具（无需用户确认，Agent 自修复自动调用）
+    "run_tests": tool_run_tests,
 }
 
 # 确认后真正执行的 handler 映射（key 与 _TOOL_REGISTRY 一致）

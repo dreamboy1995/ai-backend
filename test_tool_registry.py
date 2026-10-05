@@ -54,9 +54,12 @@ def _make_tool_call(tool_name, **arguments):
 # ============================================================
 
 def test_registered_tools_contains_all_five():
-    """注册表包含 S8 定义的 5 个标准工具"""
+    """注册表包含 S8 定义的 5 个标准工具 + S9 新增的 run_tests"""
     tools = get_registered_tools()
-    assert set(tools) == {"read_file", "write_file", "run_command", "grep_search", "git_commit"}
+    assert set(tools) == {
+        "read_file", "write_file", "run_command", "grep_search", "git_commit",
+        "run_tests",  # S9 第 85-86 天新增：测试沙箱工具
+    }
 
 
 def test_execute_unknown_tool_returns_error(tmp_workspace):

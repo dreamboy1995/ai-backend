@@ -35,6 +35,7 @@ ToolName = Literal[
     "run_command",    # 执行终端命令（需确认 + 危险命令黑名单）
     "grep_search",    # 代码正则搜索（ripgrep / Python 降级）
     "git_commit",     # Git 提交（需确认 + 变更文件列表预览）
+    "run_tests",      # S9：运行项目测试套件（pytest / jest 自动检测）
 ]
 
 
@@ -100,7 +101,7 @@ class ToolResult(BaseModel):
 #                    content 为摘要字符串，extra 携带完整结构化 RepairAttempt payload
 # - timestamp:     ISO 8601 UTC 时间戳，便于插件端按时间排序
 
-StreamMessageType = Literal["stdout", "stderr", "system", "repair_attempt"]
+StreamMessageType = Literal["stdout", "stderr", "system", "repair_attempt", "test_run"]
 
 
 class StreamMessage(BaseModel):
