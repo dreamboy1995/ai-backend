@@ -641,15 +641,74 @@ async def run_agent(
                 continue
 
             if not result.success:
-                # 执行器返回 success=False（真实失败：命令 exit_code!=0 / 文件权限不足 / 黑名单拦截等）
-                err_msg = result.error or "工具执行失败"
+                # ============================================================
+                # S9 第 83-84 天：自修复子循环入口
+                # ============================================================
+                # 步骤执行失败时，先尝试自修复循环（error_parser → repair Prompt →
+                # LLM 生成修复方案 → 执行修复 → 验证）。
+                # 自修复成功则直接 mark_done 并 continue，不再走 mark_failed。
+                # 自修复失败或触发风险预警则降级到原有的 mark_failed 流程。
+                repaired = False
+                repair_obs = ""
+                try:
+                    from app.services.self_repair import repair_loop
+                    repaired, repair_obs = await repair_loop(
+                        session=session,
+                        step=step,
+                        original_tool_result=result,
+                        tool_executor=tool_executor,
+                        workspace_root=session.workspace_root,
+                    )
+                except Exception as e:
+                    # 自修复子循环自身异常不阻断主流程——降级为常规失败处理
+                    logger.error(
+                        f"[ReAct] 自修复循环异常 step={step.id}（降级为常规失败）: "
+                        f"{e}", exc_info=True
+                    )
+                    repaired = False
+
+                if repaired:
+                    # ---- 自修复成功 ----
+                    sm.mark_done(step.id, repair_obs or "(自修复后执行成功)")
+                    session.consecutive_failures = 0  # 成功重置连续失败计数
+                    _save_preserving_flags(session, store)
+                    logger.info(
+                        f"[ReAct] ✅ step={step.id} 自修复成功，标记 done，继续后续步骤"
+                    )
+                    continue
+
+                # ---- 自修复失败（或被风险预警跳过）----
+                # 先检查全局自修复熔断（自杀开关）：session.total_retries_used 已达上限
+                # repair_obs 会包含熔断信息（"全局自修复熔断已触发..."）
+                if "全局自修复熔断" in (repair_obs or ""):
+                    exit_reason = END_REASON_FUSED
+                    fuse_msg = (
+                        f"{repair_obs}\n"
+                        f"已自动暂停 Agent 执行，请人工检查后再恢复。"
+                    )
+                    session.final_answer = fuse_msg
+                    end_message = fuse_msg
+                    session.is_executing = False
+                    session.is_paused = True
+                    session.interrupt_flag = True
+                    _save_preserving_flags(session, store)
+                    logger.warning(
+                        f"[ReAct] 全局自修复熔断触发: session={session_id}, "
+                        f"total_retries={session.total_retries_used}/{session.max_total_retries}, "
+                        f"step={step.id}"
+                    )
+                    break
+
+                # ---- 走原有 mark_failed 流程 ----
+                err_msg = repair_obs or result.error or "工具执行失败"
                 sm.mark_failed(step.id, err_msg)
 
                 # S8 第 79-80 天：熔断机制——连续失败计数
                 # deny 不算（Agent 无法控制用户决策），交互式不算（已在上面处理）
                 session.consecutive_failures += 1
                 logger.warning(
-                    f"[ReAct] 工具执行失败 step={step.id}: {err_msg}. "
+                    f"[ReAct] 工具执行失败 step={step.id} "
+                    f"（自修复也未成功）: {err_msg[:120]}. "
                     f"连续失败={session.consecutive_failures}/{settings.TOOL_FAIL_FUSE_LIMIT}"
                 )
 

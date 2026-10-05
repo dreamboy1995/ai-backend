@@ -174,6 +174,9 @@ async def get_status(session_id: str):
         fused_threshold=settings.TOOL_FAIL_FUSE_LIMIT,
         # S8 第 79-80 天：沙箱模式
         sandbox_mode=session.sandbox_mode,
+        # S9 第 83-84 天：全局自修复熔断状态
+        total_retries_used=session.total_retries_used,
+        max_total_retries=session.max_total_retries,
     )
 
 

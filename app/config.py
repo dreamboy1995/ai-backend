@@ -323,6 +323,78 @@ class Settings(BaseSettings):
     # 防止 Agent 在某个步骤反复撞墙、空耗 Token。
     TOOL_FAIL_FUSE_LIMIT: int = 3
 
+    # ============================================================
+    # S9 第 83-84 天：自修复循环引擎配置
+    # ============================================================
+    # 单步自修复最大重试次数（对应 Sprint_9.md 默认值 3）。
+    # TaskStep.max_retries 默认值；Planner 未显式指定时使用此值。
+    SELF_REPAIR_MAX_RETRIES: int = 3
+    # 全局自修复熔断阈值（自杀开关，对应 Sprint_9.md 默认值 20）。
+    # 跨所有步骤累计的 repair 尝试次数超过此值时，强制终止 Agent 循环。
+    SELF_REPAIR_MAX_TOTAL_RETRIES: int = 20
+    # 是否启用自修复循环（全局开关，可在开发/调试时临时关闭）。
+    SELF_REPAIR_ENABLED: bool = True
+    # 自修复子循环中模型调用的超时（秒）。
+    # 修复 Prompt 比 Reason 短，但需要充分推理错误根源，给 60s。
+    SELF_REPAIR_STEP_TIMEOUT_SECONDS: float = 60.0
+    # 自修复阶段采样温度。
+    # 较低温度让修复方案更稳定、更少"花活"。
+    SELF_REPAIR_TEMPERATURE: float = 0.3
+    # 自修复阶段 max_tokens。修复输出通常是代码片段或命令，给 4096 足够。
+    SELF_REPAIR_MAX_TOKENS: int = 4096
+    # 自修复 Prompt 中的代码片段长度上限（防止大文件撑爆 Prompt）。
+    # 超过时只保留错误行附近 N 行上下文。
+    SELF_REPAIR_CODE_SNIPPET_MAX_LINES: int = 50
+
+    # S9 风险预警 1：无限修复循环防护
+    # - 连续 N 次修复尝试产生相同 Diff 或相同错误类型 → 判定为"修复无效"，提前终止
+    SELF_REPAIR_SAME_DIFF_MAX: int = 2        # 连续 2 次相同 Diff → 终止
+    SELF_REPAIR_DIFFERENT_ERROR_MAX: int = 3  # 最近 3 次错误类型全不同 → "拆东墙补西墙"，终止
+
+    # 自修复 Prompt 模板（对应 Sprint_9.md "修复 Prompt 模板（关键）"）
+    # 使用 {{placeholder}} 占位符，在运行时 format 替换（注意用双花括号避免与 Python str.format 冲突）
+    SELF_REPAIR_PROMPT_TEMPLATE: str = """你刚才执行任务时遇到了错误。请分析错误原因并生成修复方案。
+
+【错误类型】：{error_type}
+【错误信息】：{error_message}
+【出错位置】：{file_path} 第 {line_number} 行
+【检测到的语言】：{language}
+【原始工具调用】：{tool_name} {tool_params}
+【错误栈摘要】：
+{code_snippet}
+
+**任务**：请决定如何修复这个错误。你可以：
+1. 调用 write_file 修改出错的文件
+2. 调用 run_command 用不同参数重新执行命令
+
+返回严格的 JSON 对象，格式如下：
+{{
+  "tool": "write_file 或 run_command",
+  "params": {{...修复后的参数...}}
+}}
+
+**注意**：
+- 只返回一个 JSON 对象，不要任何解释、问候语或 markdown 代码围栏标记
+- write_file 的 content 字段必须包含完整的修正后文件内容（从第一行到最后一行）
+- run_command 的 cmd 字段可以使用 cd / workdir 来定位路径，但不能假设 workdir 是什么
+- 确保修复后不会引入新的错误
+"""
+    # 自修复 Prompt（无 file_path 场景——比如 run_command 命令本身错了）
+    SELF_REPAIR_PROMPT_NO_FILE: str = """你刚才执行任务时遇到了错误。请分析错误原因并生成修复方案。
+
+【错误类型】：{error_type}
+【错误信息】：{error_message}
+【原始工具调用】：{tool_name} {tool_params}
+
+**任务**：请决定如何修复。返回严格的 JSON 对象：
+{{
+  "tool": "write_file 或 run_command",
+  "params": {{...修复后的参数...}}
+}}
+
+只返回一个 JSON 对象本身，不要任何解释或 markdown 标记。
+"""
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

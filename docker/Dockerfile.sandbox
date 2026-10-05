@@ -1,0 +1,48 @@
+# ============================================================
+# AI Backend Docker 沙箱镜像
+# ============================================================
+# 基于 python:3.11-slim，补齐 Agent 执行任务所需的基础工具链。
+#
+# 为什么不用官方 python:3.11（非 slim）？
+#   - 体积 ~1GB，slim 仅 ~130MB，沙箱不需要完整工具链
+#   - 按需装包，镜像可控、启动更快
+#
+# 构建：
+#   docker build -f docker/Dockerfile.sandbox -t ai-agent-sandbox:latest .
+#
+# 使用（config.py）：
+#   SANDBOX_DOCKER_IMAGE = "ai-agent-sandbox:latest"
+# ============================================================
+
+FROM python:3.11-slim
+
+# 避免 apt 交互式提示
+ENV DEBIAN_FRONTEND=noninteractive
+
+# 安装 Agent 常用工具：
+#   git               — git init / commit / clone（Agent 任务必有）
+#   curl / wget       — 下载资源、API 测试
+#   build-essential   — gcc/g++/make，pip install 某些包（如 numpy）需要编译
+#   ca-certificates   — HTTPS 请求证书（pip / curl 必备）
+#   pkg-config        — 编译 Python C 扩展时定位系统库
+#   && apt-get clean + rm -rf /var/lib/apt/lists/* 是经典 slim 瘦身配方，
+#   确保最终镜像体积尽量小
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git \
+        curl \
+        wget \
+        build-essential \
+        ca-certificates \
+        pkg-config \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# 验证关键工具存在（构建时就暴露问题，而不是运行时才发现）
+RUN git --version && python3 --version
+
+# 默认工作目录（容器真正执行时由 docker exec -w /workspace 覆盖）
+WORKDIR /workspace
+
+# 容器生命周期由 orchestrator 用 sleep infinity 保持，
+# 这里只给一个合理的默认值
+CMD ["sleep", "infinity"]

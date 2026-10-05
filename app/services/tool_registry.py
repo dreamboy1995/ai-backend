@@ -460,6 +460,31 @@ def _resolve_safe_path(file_path: str, workspace_root: str) -> Optional[Path]:
         return None
 
 
+async def _normalize_file_path(file_path: str) -> str:
+    """
+    将 LLM 传来的文件路径归一为相对 workspace_root 的路径。
+
+    Docker 模式下 Prompt 告诉 LLM 使用容器内路径（/workspace/xxx），
+    但 _resolve_safe_path 基于宿主 workspace_root 校验，会把以 / 开头的
+    容器绝对路径误判为逃逸。此函数在安全校验前把 /workspace/ 前缀剥离。
+
+    Host 模式下直接原样返回。
+    """
+    try:
+        orch = await _get_sandbox_orchestrator()
+        if orch.mode != "docker":
+            return file_path
+    except Exception:
+        return file_path
+
+    ws_prefix = "/workspace/"
+    if file_path.startswith(ws_prefix):
+        return file_path[len(ws_prefix):]
+    if file_path == "/workspace":
+        return ""
+    return file_path
+
+
 # ============================================================
 # 工具实现
 # ============================================================
@@ -484,6 +509,9 @@ async def tool_read_file(
     file_path = arguments.get("file_path") or arguments.get("path")
     if not file_path or not isinstance(file_path, str):
         return ToolResult(success=False, error="缺少必填参数 file_path")
+
+    # Docker 模式下 LLM 可能输出 /workspace/xxx，归一为相对路径再做安全校验
+    file_path = await _normalize_file_path(file_path)
 
     full_path = _resolve_safe_path(file_path, workspace_root)
     if full_path is None:
@@ -577,6 +605,9 @@ async def tool_write_file(
     if mode not in ("overwrite", "append"):
         return ToolResult(success=False, error=f"非法的 mode: {mode}，仅支持 overwrite / append")
 
+    # Docker 模式下 LLM 可能输出 /workspace/xxx，归一为相对路径再做安全校验
+    file_path = await _normalize_file_path(file_path)
+
     full_path = _resolve_safe_path(file_path, workspace_root)
     if full_path is None:
         return ToolResult(success=False, error=f"文件路径非法或逃逸出工作区: {file_path}")
@@ -654,6 +685,9 @@ async def _do_write_file(
     file_path = arguments.get("file_path") or arguments.get("path")
     content = arguments["content"]
     mode = arguments.get("mode", "overwrite")
+
+    # Docker 模式下 LLM 可能输出 /workspace/xxx，归一为相对路径再做安全校验
+    file_path = await _normalize_file_path(file_path)
 
     full_path = _resolve_safe_path(file_path, workspace_root)
     if full_path is None:
@@ -803,10 +837,17 @@ async def _do_run_command(
         output += ("\n" if output else "") + stderr_text
 
     if exit_code != 0:
+        # 错误信息同时退出码和 stderr，便于日志排查
+        # 比如 "git: not found" 这种关键诊断信息原来只藏在 output 里
+        err_msg = f"命令退出码 {exit_code}"
+        if stderr_text.strip():
+            # stderr 可能很长，取首行（通常最关键）+ 截断
+            first_line = stderr_text.strip().splitlines()[0] if stderr_text.strip() else ""
+            err_msg = f"{err_msg}: {first_line}"
         return ToolResult(
             success=False,
             output=output,
-            error=f"命令退出码 {exit_code}",
+            error=err_msg,
         )
 
     return ToolResult(success=True, output=output)

@@ -1,4 +1,4 @@
-﻿"""
+"""
 S7 第 61-62 天：Agent 核心数据结构定义
 
 定义 Agent 状态机所需的 Pydantic 模型，以及 S7 新增接口的请求/响应 DTO。
@@ -20,6 +20,8 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
+from app.services.error_parser import ParsedError
+
 
 # ============================================================
 # Agent 核心状态数据结构
@@ -27,6 +29,63 @@ from pydantic import BaseModel, Field
 
 StepStatus = Literal["pending", "running", "done", "failed", "blocked"]
 SUGGESTED_TOOLS = Literal["write_file", "run_command", "search_code", "ask_user"]
+
+
+# ============================================================
+# S9 第 83-84 天：自修复循环相关数据结构
+# ============================================================
+
+class RepairAttempt(BaseModel):
+    """
+    单次自修复尝试的完整记录。
+
+    对应 S9 Sprint 文档中"Builder 面板展示修复时间线"的每一条时间线项：
+    - attempt_number / max_retries：第几次尝试
+    - error_summary：尝试前的错误摘要（来自 ParsedError）
+    - diff：该次修复产生的 Diff（供 Builder 面板 Diff 组件展示）
+    - result：修复结果（success / failed）
+    - timestamp：该次尝试完成时间
+
+    所有字段 JSON 可序列化，便于：
+      - 随 TaskStep.error_history 持久化到 Redis
+      - 通过 WebSocket repair_attempt 事件推送给 Builder 面板
+      - 后端日志审计
+    """
+
+    attempt_number: int = Field(..., description="本次修复尝试序号（1-based）")
+    max_retries: int = Field(..., description="本步骤最大允许重试次数")
+    error_summary: str = Field(
+        default="",
+        description="尝试前的错误摘要，如 'ModuleNotFoundError: No module named fastapi'",
+    )
+    error_file: Optional[str] = Field(default=None, description="错误发生文件（相对路径）")
+    error_line: Optional[int] = Field(default=None, description="错误发生行号")
+    diff: str = Field(
+        default="",
+        description="本次修复产生的 Unified Diff 文本；无 Diff（如改命令参数）时为空",
+    )
+    result: Literal["success", "failed", "skipped", "fused"] = Field(
+        ...,
+        description="本次修复结果：success=修复成功 / failed=仍失败 / skipped=因风险预警跳过 / fused=达到熔断",
+    )
+    result_summary: str = Field(default="", description="本次修复的文字描述（供日志）")
+    timestamp: float = Field(default_factory=time.time, description="该次尝试完成时间戳")
+
+    def to_sse_dict(self) -> Dict[str, Any]:
+        """转换为 WebSocket repair_attempt 事件的数据体"""
+        return {
+            "type": "repair_attempt",
+            "attempt_number": self.attempt_number,
+            "max_retries": self.max_retries,
+            "error": {
+                "summary": self.error_summary,
+                "file": self.error_file,
+                "line": self.error_line,
+            },
+            "diff": self.diff,
+            "result": self.result,
+            "result_summary": self.result_summary,
+        }
 
 # ============================================================
 # 会话结束原因常量
@@ -76,6 +135,30 @@ class TaskStep(BaseModel):
     retry_count: int = Field(default=0, ge=0, description="已重试次数")
     # 建议使用的工具（Planner 输出字段，状态机不直接使用，仅供 UI 展示与调试）
     suggested_tool: Optional[SUGGESTED_TOOLS] = Field(default=None, description="Planner 建议的工具")
+
+    # ============================================================
+    # S9 第 83-84 天：自修复循环相关字段
+    # ============================================================
+    # 单步最大自修复重试次数（Sprint_9.md 默认 3）。0 表示禁用自修复。
+    # 该值在 Step 创建时由 Planner 决定，或在 self_repair 运行时 fallback 到 settings。
+    max_retries: int = Field(default=3, ge=0, description="自修复最大重试次数（默认 3）")
+    # 自修复尝试的完整历史（Builder 面板时间线数据源）。
+    # 列表中每个元素是一次修复尝试的详细记录；首次执行失败时写入第一条。
+    repair_history: List[RepairAttempt] = Field(
+        default_factory=list,
+        description="自修复尝试历史（S9 Builder 面板时间线数据源）",
+    )
+    # 该步骤最后一次执行捕获的 ParsedError（结构化错误信息）。
+    # 自修复循环用它来构建修复 Prompt、SSE repair_attempt 事件也引用它。
+    last_parsed_error: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="最后一次执行的结构化错误（ParsedError.model_dump()）",
+    )
+    # 是否为纯执行步骤（无需自修复）。某些 ask_user 或 search_code 类型的步骤不需要自修复。
+    disable_self_repair: bool = Field(
+        default=False,
+        description="若为 True，本步骤跳过自修复循环，直接 failed（默认 False）",
+    )
 
     model_config = {
         "json_schema_extra": {
@@ -137,6 +220,18 @@ class AgentSession(BaseModel):
     # S8 第 79-80 天：沙箱模式（会话实际生效的模式）
     # 初始化时由 react_loop.start_agent_loop 写入，可能因 Docker 不可用而从 docker 降级到 host。
     sandbox_mode: str = Field(default="", description="会话实际沙箱模式：docker / host（空字符串表示未初始化）")
+    # S9 第 83-84 天：全局自修复熔断
+    # 累计所有步骤的自修复尝试次数总和，超过 max_total_retries 时强制终止（自杀开关）。
+    # 对应 S9 风险预警："如果整个 Agent 的 retry_count 累计超过 20 次，
+    # 强制终止任务，防止无限消耗 Token 和 API 费用"。
+    total_retries_used: int = Field(
+        default=0, ge=0,
+        description="全局累计自修复尝试次数（跨所有步骤）",
+    )
+    max_total_retries: int = Field(
+        default=20, ge=1,
+        description="全局熔断阈值：超过此值强制终止 Agent（默认 20）",
+    )
     # 会话结束原因与描述（持久化到 Redis，供前端判断会话是否已死亡）
     # 取值见 END_REASON_* 常量；None 表示运行中或未开始
     end_reason: Optional[str] = Field(default=None, description="会话结束原因")
@@ -243,6 +338,9 @@ class AgentStatusResponse(BaseModel):
     fused_threshold: int = Field(default=3, description="熔断阈值 TOOL_FAIL_FUSE_LIMIT")
     # S8 第 79-80 天：沙箱模式（前端设置面板显示）
     sandbox_mode: str = Field(default="", description="会话实际生效的沙箱模式：docker / host")
+    # S9 第 83-84 天：全局自修复熔断状态（前端展示"已消耗 N/20 次修复机会"）
+    total_retries_used: int = Field(default=0, description="全局累计自修复尝试次数")
+    max_total_retries: int = Field(default=20, description="全局修复熔断阈值")
 
 
 class ToolConfirmRequest(BaseModel):

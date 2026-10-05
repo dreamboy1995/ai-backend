@@ -83,29 +83,38 @@ class ToolResult(BaseModel):
 
 
 # ============================================================
-# 终端日志流式消息（S8 第 75-76 天）
+# 终端日志流式消息（S8 第 75-76 天 + S9 扩展）
 # ============================================================
 # 对应 Sprint_8.md「关键接口/数据结构变更」：
 #   ws://localhost:3000/v1/agent/stream/{session_id}
 #   interface StreamMessage {
-#     type: 'stdout' | 'stderr' | 'system';
+#     type: 'stdout' | 'stderr' | 'system' | 'repair_attempt';  // S9 新增
 #     content: string;  // 可能包含 ANSI 颜色码
 #     timestamp: string;
+#     extra?: object;   // S9 新增：复杂事件的结构化 payload
 #   }
 #
 # - stdout/stderr: 命令进程的实时输出（按行推送，可能含 ANSI 颜色码）
 # - system:        系统事件（启动提示、退出码、超时杀进程等元信息）
+# - repair_attempt:S9 第 83-84 天：自修复尝试事件（Builder 面板时间线数据源）
+#                    content 为摘要字符串，extra 携带完整结构化 RepairAttempt payload
 # - timestamp:     ISO 8601 UTC 时间戳，便于插件端按时间排序
 
-StreamMessageType = Literal["stdout", "stderr", "system"]
+StreamMessageType = Literal["stdout", "stderr", "system", "repair_attempt"]
 
 
 class StreamMessage(BaseModel):
     """终端日志流式消息（通过 WebSocket 推送给插件端）"""
 
-    type: StreamMessageType = Field(..., description="消息类型：stdout/stderr/system")
-    content: str = Field(..., description="输出内容，可能包含 ANSI 颜色码")
+    type: StreamMessageType = Field(..., description="消息类型：stdout/stderr/system/repair_attempt")
+    content: str = Field(..., description="输出内容或事件摘要（文本）")
     timestamp: str = Field(..., description="ISO 8601 UTC 时间戳")
+    # S9 第 83-84 天：复杂事件的结构化 payload（可选）
+    # repair_attempt 事件使用该字段携带完整 RepairAttempt.to_sse_dict() 数据
+    extra: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="结构化 payload（repair_attempt 等复杂事件使用）",
+    )
 
 
 # ============================================================
