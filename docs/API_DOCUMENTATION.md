@@ -687,14 +687,22 @@ Content-Type: application/json
 
 **GET** `/v1/search?q=<query>&top_k=<n>`
 
-通过 LanceDB 向量检索返回语义最相关的代码切片。
+将查询文本向量化后，在 LanceDB 向量库中检索语义最相关的代码切片（函数/类/变量等）。即使关键词与函数名不完全匹配（如搜"排序"能返回 `sort` 函数），也能通过语义召回。
+
+> ⚠️ 需要先调用 `POST /v1/index/start` 完成索引，否则返回 **409**。
+
+#### 请求头
+
+```
+Authorization: Bearer {accessToken}
+```
 
 #### 请求参数
 
-| 参数 | 类型 | 默认值 | 描述 |
-|------|------|--------|------|
-| q | string | - | 搜索关键词（必填） |
-| top_k | number | 10 | 返回数量（1~100） |
+| 参数 | 类型 | 必需 | 默认值 | 范围 / 约束 | 描述 |
+|------|------|------|--------|------------|------|
+| q | string | 是 | - | 非空字符串（min_length=1） | 搜索关键词，支持自然语言描述和中英混合 |
+| top_k | number | 否 | 10 | 1 ~ 100 | 返回的最大结果数 |
 
 #### 响应
 
@@ -712,6 +720,7 @@ Content-Type: application/json
       "content": "def sort_data(arr): return sorted(arr)",
       "start_line": 10,
       "end_line": 12,
+      "embedding_version": "v1",
       "distance": 0.34,
       "score": 0.82
     }
@@ -719,7 +728,63 @@ Content-Type: application/json
 }
 ```
 
-> 若代码库尚未索引，返回 `409`: "代码库尚未建立向量索引，请先调用 POST /v1/index/start"
+#### 响应字段说明
+
+**SearchResponse 顶层字段**
+
+| 字段 | 类型 | 描述 |
+|------|------|------|
+| query | string | 回显的原始查询文本 |
+| top_k | number | 实际使用的 top_k 值 |
+| total | number | 本次匹配到的实际结果数（可能小于 top_k） |
+| results | Array[SearchResultItem] | 排序后的结果列表（按相似度降序） |
+
+**SearchResultItem 单条结果字段**
+
+| 字段 | 类型 | 默认值 | 描述 |
+|------|------|--------|------|
+| id | string | - | 向量库内部唯一标识（UUID） |
+| file_path | string | - | 文件相对路径（POSIX 正斜杠，已归一化到工作区） |
+| symbol_name | string | - | 命中的符号名（函数名/类名/变量名） |
+| chunk_type | string | - | 代码切片类型：`function` / `class` / `variable` / `import` 等 |
+| content | string | - | 代码切片的完整文本内容 |
+| start_line | number | - | 起始行号（1-based） |
+| end_line | number | - | 结束行号（1-based，闭区间） |
+| embedding_version | string | `""` | Embedding 模型版本号（如 `"v1"`），用于后续索引迁移比对 |
+| distance | float | `0.0` | LanceDB L2 欧氏距离，**越小越相似** |
+| score | float | `0.0` | 归一化相似度分数（0~1），**越大越相似**。前端展示推荐使用此字段 |
+
+> **distance vs score**：`distance` 是向量空间的原始 L2 距离，仅对排序有意义；`score` 是后端将距离归一化到 [0, 1] 的相似度，便于前端直接展示相关性程度。两个字段同时返回，由消费方按需选取。
+
+#### 特殊行为
+
+- **工作区隔离过滤**：向量库为全局共享，可能残留其他工作区或系统临时目录的脏数据。接口返回前会做两层过滤 —— `file_path` 必须落在当前 `workspace_root` 内，且文件必须真实存在。过滤后可能导致 `total < top_k`。
+- **路径归一化**：所有返回的 `file_path` 自动转为相对于工作区根目录的 POSIX 正斜杠路径，确保前端可以直接跳转。
+- **语义匹配能力**：依赖 Embedding 模型将查询文本映射到向量空间，不做关键词精确匹配。中英文描述均可触发召回（如"读取文件"能命中 `read_file` 函数，"sort" 能命中 `排序` 相关代码）。
+
+#### 状态码
+
+| 状态码 | 场景 | 响应 detail |
+|--------|------|-------------|
+| 200 | 搜索成功（即使 total=0 也返回 200，results 为空数组） | - |
+| 401 | 未认证 / 令牌无效 | - |
+| 409 | 代码库尚未建立向量索引 | `"代码库尚未建立向量索引，请先调用 POST /v1/index/start 触发索引"` |
+| 422 | 参数校验失败（如 `q` 为空字符串、`top_k` 超出 1~100 范围） | FastAPI 自动生成的校验错误详情 |
+| 429 | 限频超限 | - |
+| 500 | 查询向量化失败或向量检索底层异常 | `"查询向量化失败: ..."` / `"向量检索失败: ..."` |
+
+#### cURL 示例
+
+```bash
+# 搜索相关函数
+curl -X GET "http://localhost:3000/v1/search?q=排序函数&top_k=5" \
+     -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIs..."
+
+# 空结果场景（查询无匹配）
+curl -X GET "http://localhost:3000/v1/search?q=不存在的关键词" \
+     -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIs..."
+# => {"query":"不存在的关键词","top_k":10,"total":0,"results":[]}
+```
 
 ---
 
