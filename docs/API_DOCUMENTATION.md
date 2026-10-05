@@ -248,9 +248,9 @@ Content-Type: application/json
 | model | string | 否 | "glm-4.5-air" | 模型名称 |
 | temperature | number | 否 | 0.7 | 温度参数，控制随机性 |
 | stream | boolean | 否 | true | 是否流式输出（非流式暂不支持） |
-| max_tokens | number | 否 | null | 最大令牌数，不传则根据 mode 自动设置 |
+| max_tokens | number | 否 | 由 mode 决定 | 最大令牌数，不传则根据 mode 自动设置：chat=4096 / new=8192 / inline=8192 / builder=4096 |
 | session_id | string | 否 | null | 会话 ID。携带时后端维护多轮对话历史并滑动窗口裁剪；不携带时为无状态模式 |
-| mode | string | 否 | "chat" | 请求模式：`chat` 普通对话(60s) / `new` 单文件生成(120s) / `inline` Inline Chat(120s) / `builder` 预留 |
+| mode | string | 否 | "chat" | 请求模式（决定超时与默认 max_tokens）：`chat` 普通对话(60s,4096) / `new` 单文件生成(120s,8192) / `inline` Inline Chat(120s,8192) / `builder` 预留占位(当前行为同 chat) |
 | contexts | Array[ContextItem] | 否 | null | 上下文数组（@文件 / @选中代码 / 隐式上下文） |
 | retrieval_config | RetrievalConfig | 否 | null | 自动检索配置，开启后后端用混合检索器注入相关代码片段 |
 | inline_selection | InlineSelection | 否 | null | Inline Chat 选中代码范围（mode='inline' 时使用） |
@@ -313,6 +313,8 @@ Content-Type: application/json
 }
 ```
 
+> ⚠️ **后端隐式注入行为**：当传入 `inline_selection` 时，后端会自动将选中代码转为 `type="selection"` 的 ContextItem 注入 System Prompt，并在行首加注 `[行 10-12，共 3 行]` 标注以便模型定位。若用户同时在 `contexts` 中显式传了同文件的 selection，后端会按 `file_path` 去重避免重复注入。**通常只需传 `inline_selection` 即可，无需重复传 `contexts`**。
+
 #### ResponseFormat 结构
 
 ```json
@@ -329,7 +331,17 @@ Content-Type: application/json
 - **后端防御**：单条 `content_snippet` 超过 50000 字符时返回 422
 - **Token 计数**：使用 `tiktoken` 的 `cl100k_base` 编码精确计数
 - **丢弃优先级**：用户主动 @ 的（file/selection）保留，implicit 自动附带的优先截断
-- **JSON Mode 风险**：`response_format=json_object` 时独立超时 30 秒，超过返回友好提示
+- **JSON Mode 风险**：`response_format=json_object` 时独立超时 30 秒，超过返回友好提示「生成时间过长，请简化需求重试」
+
+#### JSON Mode 自动重试机制
+
+当 `response_format=json_object`（多文件修改场景）时，后端在模型流式输出完成后会做自动解析与重试：
+
+1. 提取模型返回文本中的第一个 `{` 到最后一个 `}` 之间的内容，校验是否为合法 JSON 且包含 `files` 数组
+2. **首次解析失败** → 自动重试一次：在 User Message 末尾追加强制指令「只返回合法的 JSON 对象，不要任何解释、问候语或 markdown 代码围栏标记」，再次调用模型
+3. **重试仍失败** → 降级为纯文本输出，不推送 type:diff 块，前端仅展示普通对话回复
+
+> 此机制是为了应对模型偶尔在 JSON 前后加 ```json 代码围栏标记或拒绝返回 JSON 的情况，避免多文件修改场景直接失败。
 
 #### 会话管理
 
@@ -356,6 +368,8 @@ data: {"type":"meta","references":[
 data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1699999999,"model":"glm-4.5-air","choices":[{"index":0,"delta":{"content":"你好"},"finish_reason":null}]}
 data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1699999999,"model":"glm-4.5-air","choices":[{"index":0,"delta":{"content":"世界"},"finish_reason":"stop"}]}
 ```
+
+> **usage 字段说明**：ChatChunk 包含可选的 `usage` 字段（结构为 `{prompt_tokens, completion_tokens, total_tokens}`），但流式响应时各厂商适配器通常不返回此值，实际场景中始终为 null。Token 用量由后端在流结束后通过 tiktoken 单独统计并记录到配额系统。
 
 **3. type:diff（可选，多文件 JSON Mode 时 [DONE] 之前）**
 
@@ -426,6 +440,11 @@ Authorization: Bearer {accessToken}
 | quota_limit_per_day | number | 每日 Token 配额上限（默认 100000） |
 | percentage | number | 已用比例（0.0 ~ 1.0） |
 | reset_at | string | 配额重置时间（ISO 8601，UTC 午夜） |
+
+#### 状态码
+
+- `200`: 查询成功
+- `401`: 未认证 / 令牌无效 / 用户标识缺失（JWT sub 为空）
 
 ---
 
@@ -818,34 +837,119 @@ BFS 遍历查询与指定文件强关联的上下游文件。
 
 - `session_id`: Agent 会话 ID
 
-#### 响应（部分字段）
+#### 响应
 
 ```json
 {
   "session_id": "agent_sess_001",
   "user_goal": "给项目添加用户登录功能",
   "workspace_root": "/path/to/workspace",
-  "current_step_index": 2,
-  "progress": 0.4,
-  "progress_percent": 40,
+  "steps": [
+    {
+      "id": "step_1",
+      "description": "分析现有代码结构",
+      "details": "扫描项目目录，确认技术栈",
+      "status": "done",
+      "dependencies": [],
+      "action": "search_code",
+      "action_input": {"query": "项目结构"},
+      "observation": "发现 FastAPI 项目，已有 auth 模块",
+      "retry_count": 0,
+      "suggested_tool": "search_code",
+      "max_retries": 3,
+      "repair_history": [],
+      "last_parsed_error": null,
+      "disable_self_repair": false
+    }
+  ],
+  "current_step_index": 1,
+  "final_answer": null,
+  "progress": 0.25,
+  "progress_percent": 25,
   "is_executing": true,
   "is_paused": false,
   "pending_question": null,
-  "pending_confirmation_id": null,
-  "pending_confirmation_tool": null,
+  "total_steps": 4,
+  "done_steps": 1,
   "end_reason": null,
+  "end_message": null,
+  "pending_confirmation_id": null,
+  "pending_confirmation_prompt": null,
+  "pending_confirmation_preview": null,
+  "pending_confirmation_tool": null,
+  "consecutive_failures": 0,
+  "is_fused": false,
+  "fused_threshold": 3,
+  "sandbox_mode": "host",
   "total_retries_used": 0,
-  "test_results": null
+  "max_total_retries": 20,
+  "test_results": []
 }
 ```
 
-#### end_reason 枚举（终态）
+#### 字段说明
 
-- `"completed"`: 正常完成
-- `"max_iter"`: 超过最大迭代次数
-- `"timeout"`: 总超时
-- `"error"`: 执行错误
-- `"fused"`: 熔断触发
+| 字段 | 类型 | 描述 |
+|------|------|------|
+| session_id | string | 会话唯一 ID |
+| user_goal | string | 原始用户需求 |
+| workspace_root | string | 工作区根路径 |
+| steps | Array[TaskStep] | 任务步骤列表（完整 DAG，见 TaskStep 结构） |
+| current_step_index | number | 当前执行步骤索引，-1 表示未开始 |
+| final_answer | string \| null | 所有步骤完成后的最终总结 |
+| progress | number | 整体进度 0.0 ~ 1.0 |
+| progress_percent | number | 整体进度百分比 0 ~ 100 |
+| is_executing | boolean | Agent 循环是否正在执行 |
+| is_paused | boolean | 是否已暂停 |
+| pending_question | string \| null | 待用户回答的问题（ask_user 工具暂停时填充） |
+| total_steps | number | 总步骤数 |
+| done_steps | number | 已完成步骤数 |
+| end_reason | string \| null | 会话结束原因，null 表示运行中或未开始 |
+| end_message | string \| null | 会话结束的详细描述 |
+| pending_confirmation_id | string \| null | 工具确认凭证 ID（写操作暂停时填充） |
+| pending_confirmation_prompt | string \| null | 确认浮层提示文本 |
+| pending_confirmation_preview | string \| null | 确认前的预览内容（JSON 字符串） |
+| pending_confirmation_tool | string \| null | 待确认的工具名（write_file / run_command / git_commit） |
+| consecutive_failures | number | 连续工具执行失败计数（熔断判定用） |
+| is_fused | boolean | 是否已触发熔断（end_reason == 'fused'） |
+| fused_threshold | number | 熔断阈值（默认 3） |
+| sandbox_mode | string | 会话实际生效的沙箱模式：docker / host |
+| total_retries_used | number | 全局累计自修复尝试次数（跨所有步骤） |
+| max_total_retries | number | 全局修复熔断阈值（默认 20，超过强制终止） |
+| test_results | Array | 测试执行结果历史（每次 run_tests 追加一条） |
+
+#### TaskStep 结构
+
+| 字段 | 类型 | 描述 |
+|------|------|------|
+| id | string | 步骤唯一 ID（uuid） |
+| description | string | 步骤简短描述 |
+| details | string | 步骤详细说明（含技术选型） |
+| status | string | `pending` / `running` / `done` / `failed` / `blocked` |
+| dependencies | Array[string] | 依赖的前置步骤 ID 列表 |
+| action | string | 工具名称，如 write_file / run_command |
+| action_input | object | 工具参数 |
+| observation | string \| null | 执行结果反馈（Observe 阶段写入） |
+| retry_count | number | 已重试次数 |
+| suggested_tool | string \| null | Planner 建议的工具（仅供调试展示） |
+| max_retries | number | 单步自修复最大重试次数（默认 3） |
+| repair_history | Array[RepairAttempt] | 自修复尝试历史（Builder 面板时间线数据源） |
+| last_parsed_error | object \| null | 最后一次执行的结构化错误 |
+| disable_self_repair | boolean | 若为 True，本步骤跳过自修复循环 |
+
+#### end_reason 枚举
+
+| 值 | 分类 | 描述 |
+|----|------|------|
+| `"idle"` | 可恢复 | 刚创建，尚未开始执行 |
+| `"paused"` | 可恢复 | 用户主动暂停 |
+| `"ask_user"` | 可恢复 | 等待用户回答问题（ask_user） |
+| `"confirming"` | 可恢复 | 等待用户确认工具执行 |
+| `"fused"` | 可恢复 | 连续失败触发熔断，等待人工介入 |
+| `"completed"` | **终态** | 所有步骤正常完成 |
+| `"max_iter"` | **终态** | 超过最大迭代次数 |
+| `"timeout"` | **终态** | 执行总超时 |
+| `"error"` | **终态** | 执行异常 |
 
 ---
 
