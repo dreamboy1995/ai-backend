@@ -169,6 +169,15 @@ async def _run_tests_after_repair(
         f"failed={result.failed}, errors={result.errors}, summary={summary}"
     )
 
+    # ---- S9 第 87-88 天：推送 test_run SSE 事件 ----
+    # 让 Builder 面板实时渲染测试进度条（绿色 ✅ / 红色 ❌），无需等待轮询。
+    await _publish_test_run(
+        session_id=session.session_id,
+        result=result,
+        step_id=step.id,
+        trigger="auto",
+    )
+
     # ---- S9 第 85-86 天：将测试结果追加到 session.test_results 并持久化 ----
     # 让前端 Builder 面板通过 /v1/agent/status/{id} 拿到测试时间线数据源。
     # 无论测试通过、失败、超时还是框架不可用，都记录下来供 UI 渲染。
@@ -443,7 +452,7 @@ def _is_too_many_different_errors(repair_history: List[RepairAttempt]) -> bool:
 
 
 # ============================================================
-# 事件推送：repair_attempt 事件
+# 事件推送：repair_attempt 事件 + test_run 事件
 # ============================================================
 
 async def _publish_repair_attempt(session_id: str, attempt: RepairAttempt) -> None:
@@ -454,9 +463,14 @@ async def _publish_repair_attempt(session_id: str, attempt: RepairAttempt) -> No
     这里复用 command_executor 的 StreamManager，使用扩展后的 StreamMessage
     （type="repair_attempt"，extra 携带结构化 payload）。
 
-    消息结构：
-      {"type":"repair_attempt","content":"Retry 1/3 failed: ModuleNotFoundError",
-       "timestamp":"...","extra":{...完整 RepairAttempt payload...}}
+    消息结构（对应 Sprint_9.md "关键接口/数据结构变更"）：
+      type: "repair_attempt"
+      content: "Retry 2/3 success: step_3 | result_summary..."
+      extra: {
+        step_id, attempt_number, max_retries,
+        error: {type, message, summary, file, line},
+        diff, result, result_summary, timestamp
+      }
     """
     try:
         from app.services.command_executor import get_stream_manager
@@ -465,9 +479,10 @@ async def _publish_repair_attempt(session_id: str, attempt: RepairAttempt) -> No
 
         manager = get_stream_manager()
         payload = attempt.to_sse_dict()
+        error_tag = attempt.error_type or "Error"
         content = (
-            f"Retry {attempt.attempt_number}/{attempt.max_retries} "
-            f"{attempt.result}: {attempt.error_summary[:100]}"
+            f"[{attempt.step_id}] Retry {attempt.attempt_number}/{attempt.max_retries} "
+            f"{attempt.result}: {error_tag} | {attempt.result_summary[:120]}"
         )
         msg = StreamMessage(
             type="repair_attempt",
@@ -480,6 +495,88 @@ async def _publish_repair_attempt(session_id: str, attempt: RepairAttempt) -> No
         # 推送失败不影响主流程，只记 warning
         logger.warning(
             f"[SelfRepair] repair_attempt 事件推送失败（非致命）: {e}"
+        )
+
+
+async def _publish_test_run(
+    session_id: str,
+    result: Any,
+    step_id: Optional[str] = None,
+    trigger: str = "auto",
+) -> None:
+    """
+    将 TestRunResult 通过 WebSocket 推送给 Builder 面板。
+
+    对应 StreamMessageType 中的 "test_run"——让 Builder 面板实时展示
+    测试进度条（绿色 ✅ / 红色 ❌），无需等待 /status 轮询。
+
+    推送时机：
+      1. self_repair._run_tests_after_repair 中（代码修改后自动触发）
+      2. react_loop 中 Agent 主动调用 run_tests 工具后
+
+    Args:
+        session_id: Agent 会话 ID。
+        result:     TestRunResult 对象（或兼容的 dict）。
+        step_id:    触发 run_tests 的步骤 ID（可选，Builder 面板按步骤分组）。
+        trigger:    触发来源："auto"（自修复触发） / "agent"（Agent 主动调用）。
+    """
+    try:
+        from app.services.command_executor import get_stream_manager
+        from app.services.command_executor import _now_iso
+        from app.models.tool import StreamMessage
+
+        manager = get_stream_manager()
+
+        # 兼容 Pydantic 模型和 dict
+        if hasattr(result, "model_dump"):
+            result_dict = result.model_dump()
+        elif isinstance(result, dict):
+            result_dict = result
+        else:
+            result_dict = {}
+
+        # 构造人类可读的 content（前端可直接显示或忽略）
+        summary = (
+            f"测试全部通过 ✅ ({result_dict.get('passed', 0)} passed)"
+            if result_dict.get("success")
+            else (
+                f"测试失败 ❌ ({result_dict.get('passed', 0)} passed, "
+                f"{result_dict.get('failed', 0)} failed, "
+                f"{result_dict.get('errors', 0)} errors)"
+                if not result_dict.get("timed_out")
+                else f"测试超时中止 ⏱️"
+            )
+        )
+        if result_dict.get("timed_out"):
+            summary = "测试超时中止 ⏱️"
+
+        trigger_label = "自修复自动触发" if trigger == "auto" else "Agent 主动调用"
+        content = f"[test_run] {trigger_label}: {summary}"
+
+        # extra 携带完整结构化测试结果（供 Builder 面板渲染绿色/红色进度条）
+        extra = {
+            "type": "test_run",
+            "step_id": step_id,
+            "trigger": trigger,
+            "summary": summary,
+            **result_dict,  # passed, failed, errors, failures, duration_ms, framework 等
+        }
+
+        msg = StreamMessage(
+            type="test_run",
+            content=content,
+            timestamp=_now_iso(),
+            extra=extra,
+        )
+        await manager.publish(session_id, msg)
+        logger.debug(
+            f"[SelfRepair] test_run 事件已推送: session={session_id}, "
+            f"trigger={trigger}, passed={result_dict.get('passed', 0)}, "
+            f"failed={result_dict.get('failed', 0)}"
+        )
+    except Exception as e:
+        logger.warning(
+            f"[SelfRepair] test_run 事件推送失败（非致命）: {e}"
         )
 
 
@@ -579,8 +676,11 @@ async def repair_loop(
             )
             # 记录一条 fused 状态的 RepairAttempt
             ra = RepairAttempt(
+                step_id=step.id,
                 attempt_number=attempt,
                 max_retries=max_retries,
+                error_type=parsed_error.error_type,
+                error_message=parsed_error.error_message,
                 error_summary=str(parsed_error),
                 error_file=parsed_error.file_path,
                 error_line=parsed_error.line_number,
@@ -614,8 +714,11 @@ async def repair_loop(
 
         if repair_action is None:
             ra = RepairAttempt(
+                step_id=step.id,
                 attempt_number=attempt,
                 max_retries=max_retries,
+                error_type=parsed_error.error_type,
+                error_message=parsed_error.error_message,
                 error_summary=str(parsed_error),
                 error_file=parsed_error.file_path,
                 error_line=parsed_error.line_number,
@@ -668,8 +771,11 @@ async def repair_loop(
         # ---- 风险预警：修复无效检查 ----
         # 修复 action 执行了（不管成功还是失败），都记录一条 RepairAttempt
         ra = RepairAttempt(
+            step_id=step.id,
             attempt_number=attempt,
             max_retries=max_retries,
+            error_type=parsed_error.error_type,
+            error_message=parsed_error.error_message,
             error_summary=str(parsed_error),
             error_file=parsed_error.file_path,
             error_line=parsed_error.line_number,
@@ -768,8 +874,11 @@ async def repair_loop(
         # ---- 风险预警：连续相同 Diff 检查 ----
         if _is_too_many_same_diffs(step.repair_history):
             ra_skip = RepairAttempt(
+                step_id=step.id,
                 attempt_number=attempt,
                 max_retries=max_retries,
+                error_type="RiskWarn",
+                error_message="连续相同 Diff，修复无效",
                 error_summary="(风险预警触发：连续相同 Diff)",
                 result="skipped",
                 result_summary="连续修复产生相同 Diff → 模型无实质改动，提前终止",
@@ -781,8 +890,11 @@ async def repair_loop(
         # ---- 风险预警：拆东墙补西墙检查 ----
         if _is_too_many_different_errors(step.repair_history):
             ra_skip = RepairAttempt(
+                step_id=step.id,
                 attempt_number=attempt,
                 max_retries=max_retries,
+                error_type="RiskWarn",
+                error_message="最近 N 次错误类型全不同，模型在拆东墙补西墙",
                 error_summary="(风险预警触发：错误类型全不同)",
                 result="skipped",
                 result_summary="连续修复引入全新错误 → 模型在拆东墙补西墙，提前终止",

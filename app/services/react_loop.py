@@ -374,13 +374,16 @@ def _save_preserving_flags(session: AgentSession, store) -> None:
     store.save(session)
 
 
-def _record_run_tests_result(session: AgentSession, result, store) -> None:
+def _record_run_tests_result(session: AgentSession, result, store, step_id: Optional[str] = None) -> None:
     """
     将 run_tests 工具的执行结果追加到 session.test_results 并持久化。
 
     ToolResult.output 结构（见 tool_registry.tool_run_tests）：
       {"summary": "...", "test_result": TestRunResult.model_dump()}
     本函数提取 test_result 子字典追加——格式与 self_repair 里写入的一致。
+
+    同时推送 SSE test_run 事件（S9 第 87-88 天），让 Builder 面板
+    实时展示测试进度条（绿色 ✅ / 红色 ❌），无需等待 /status 轮询。
 
     容错：任何异常只记 warning，不中断主流程。
     """
@@ -397,6 +400,23 @@ def _record_run_tests_result(session: AgentSession, result, store) -> None:
             f"[ReAct] run_tests 结果已追加到 session: "
             f"session={session.session_id}, total_records={len(session.test_results)}"
         )
+
+        # ---- S9 第 87-88 天：推送 test_run SSE 事件 ----
+        # fire-and-forget，不阻塞主循环
+        try:
+            from app.services.self_repair import _publish_test_run
+
+            asyncio.create_task(
+                _publish_test_run(
+                    session_id=session.session_id,
+                    result=record,
+                    step_id=step_id,
+                    trigger="agent",
+                )
+            )
+        except Exception:
+            pass  # 推送失败完全不影响主流程
+
     except Exception as e:
         logger.warning(
             f"[ReAct] run_tests 结果持久化失败（不影响主流程）: {e}"
@@ -631,7 +651,7 @@ async def run_agent(
             # 提取 test_result 子字典（与 self_repair._run_tests_after_repair
             # 写入格式一致），追加到 session.test_results 并持久化。
             if tool == "run_tests":
-                _record_run_tests_result(session, result, store)
+                _record_run_tests_result(session, result, store, step_id=step.id)
 
             # ---- 确认检测（S8 确认链路）----
             # 当 ToolResult.requires_confirmation=True 时，

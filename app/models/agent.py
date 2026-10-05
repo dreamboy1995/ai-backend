@@ -40,20 +40,50 @@ class RepairAttempt(BaseModel):
     单次自修复尝试的完整记录。
 
     对应 S9 Sprint 文档中"Builder 面板展示修复时间线"的每一条时间线项：
+    - step_id:             所属步骤 ID（Builder 面板按步骤分组修复时间线）
     - attempt_number / max_retries：第几次尝试
-    - error_summary：尝试前的错误摘要（来自 ParsedError）
-    - diff：该次修复产生的 Diff（供 Builder 面板 Diff 组件展示）
-    - result：修复结果（success / failed）
-    - timestamp：该次尝试完成时间
+    - error_type / error_message：结构化错误类型和消息（来自 ParsedError）
+    - error_summary：      人类可读的错误摘要（如 "ModuleNotFoundError: No module named fastapi"）
+    - diff：               该次修复产生的 Unified Diff（供 Builder 面板 Diff 组件展示）
+    - result：             修复结果（success / failed）
+    - timestamp：          该次尝试完成时间
 
     所有字段 JSON 可序列化，便于：
-      - 随 TaskStep.error_history 持久化到 Redis
+      - 随 TaskStep.repair_history 持久化到 Redis
       - 通过 WebSocket repair_attempt 事件推送给 Builder 面板
       - 后端日志审计
+
+    SSE 事件格式（对应 Sprint_9.md "关键接口/数据结构变更"）：
+    {
+      "type": "repair_attempt",
+      "step_id": "step_3",
+      "attempt_number": 1,
+      "max_retries": 3,
+      "error": {
+        "type": "NameError",
+        "message": "name 'app' is not defined",
+        "file": "main.py",
+        "line": 10
+      },
+      "diff": "--- a/main.py\n+++ b/main.py\n@@ -1,3 +1,4 @@\n+from fastapi import FastAPI\n app = FastAPI()",
+      "result": "success",
+      "result_summary": "...",
+      "timestamp": 1234567890.0
+    }
     """
 
+    step_id: str = Field(default="", description="所属步骤 ID（与 TaskStep.id 一致）")
     attempt_number: int = Field(..., description="本次修复尝试序号（1-based）")
     max_retries: int = Field(..., description="本步骤最大允许重试次数")
+    # 结构化错误信息（来自 ParsedError.error_type / error_message）
+    error_type: Optional[str] = Field(
+        default=None,
+        description="结构化错误类型，如 'ModuleNotFoundError' / 'NameError' / 'TestFailure'",
+    )
+    error_message: Optional[str] = Field(
+        default=None,
+        description="结构化错误消息（完整的错误描述）",
+    )
     error_summary: str = Field(
         default="",
         description="尝试前的错误摘要，如 'ModuleNotFoundError: No module named fastapi'",
@@ -72,12 +102,15 @@ class RepairAttempt(BaseModel):
     timestamp: float = Field(default_factory=time.time, description="该次尝试完成时间戳")
 
     def to_sse_dict(self) -> Dict[str, Any]:
-        """转换为 WebSocket repair_attempt 事件的数据体"""
+        """转换为 WebSocket repair_attempt 事件的数据体（对应 Sprint_9.md 规范）"""
         return {
             "type": "repair_attempt",
+            "step_id": self.step_id,
             "attempt_number": self.attempt_number,
             "max_retries": self.max_retries,
             "error": {
+                "type": self.error_type,
+                "message": self.error_message,
                 "summary": self.error_summary,
                 "file": self.error_file,
                 "line": self.error_line,
@@ -85,6 +118,7 @@ class RepairAttempt(BaseModel):
             "diff": self.diff,
             "result": self.result,
             "result_summary": self.result_summary,
+            "timestamp": self.timestamp,
         }
 
 # ============================================================
