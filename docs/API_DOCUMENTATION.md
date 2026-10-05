@@ -10,6 +10,10 @@ AI Backend 是一个基于 FastAPI 的 AI 编程助手后端服务，代理多�
 - **认证方式**: JWT Bearer Token（全局中间件校验，除健康检查和文档外均需认证）
 - **API版本**: v1
 - **响应格式**: JSON / SSE（流式）/ WebSocket
+- **字段命名**: 后端 Pydantic model 默认使用 Python `snake_case` 风格，所有请求体和响应体的 JSON 字段名均为 `snake_case`（如 `session_id`、`workspace_root`、`total_symbols`）。
+- **Auth 接口例外**: `/auth/token` 接口特殊配置了 `alias_generator=to_camel + response_model_by_alias=True`，请求字段和响应字段使用 `camelCase`（`apiKey` / `accessToken` / `expiresIn`）。
+
+> ⚠️ **命名约定说明**：本文档所有 JSON 示例中的字段名均与后端实际行为保持一致。绝大多数接口使用 `snake_case`，仅 `/auth/token` 接口使用 `camelCase`（后端 auth.py 单独配置了 alias generator）。此前版本曾混淆，已根据后端 OpenAPI schema + Pydantic 源码逐接口修正。前端插件代码已按此约定与后端对齐。
 
 ## 环境配置
 
@@ -206,7 +210,7 @@ Content-Type: application/json
 
 ```json
 {
-  "sessionId": "sess_abc123",
+  "session_id": "sess_abc123",
   "messages": [
     {
       "role": "user",
@@ -216,23 +220,23 @@ Content-Type: application/json
   "model": "glm-4.5-air",
   "temperature": 0.7,
   "stream": true,
-  "maxTokens": null,
+  "max_tokens": null,
   "mode": "chat",
   "contexts": [
     {
       "type": "file",
-      "filePath": "src/main.py",
-      "contentSnippet": "def hello():\n    print('hello')\n",
+      "file_path": "src/main.py",
+      "content_snippet": "def hello():\n    print('hello')\n",
       "language": "python"
     }
   ],
-  "retrievalConfig": {
-    "autoContext": true,
-    "topK": 5,
-    "includeReferences": true
+  "retrieval_config": {
+    "auto_context": true,
+    "top_k": 5,
+    "include_references": true
   },
-  "inlineSelection": null,
-  "responseFormat": null
+  "inline_selection": null,
+  "response_format": null
 }
 ```
 
@@ -244,13 +248,13 @@ Content-Type: application/json
 | model | string | 否 | "glm-4.5-air" | 模型名称 |
 | temperature | number | 否 | 0.7 | 温度参数，控制随机性 |
 | stream | boolean | 否 | true | 是否流式输出（非流式暂不支持） |
-| maxTokens | number | 否 | null | 最大令牌数，不传则根据 mode 自动设置 |
-| sessionId | string | 否 | null | 会话 ID。携带时后端维护多轮对话历史并滑动窗口裁剪；不携带时为无状态模式 |
+| max_tokens | number | 否 | null | 最大令牌数，不传则根据 mode 自动设置 |
+| session_id | string | 否 | null | 会话 ID。携带时后端维护多轮对话历史并滑动窗口裁剪；不携带时为无状态模式 |
 | mode | string | 否 | "chat" | 请求模式：`chat` 普通对话(60s) / `new` 单文件生成(120s) / `inline` Inline Chat(120s) / `builder` 预留 |
 | contexts | Array[ContextItem] | 否 | null | 上下文数组（@文件 / @选中代码 / 隐式上下文） |
-| retrievalConfig | RetrievalConfig | 否 | null | 自动检索配置，开启后后端用混合检索器注入相关代码片段 |
-| inlineSelection | InlineSelection | 否 | null | Inline Chat 选中代码范围（mode='inline' 时使用） |
-| responseFormat | ResponseFormat | 否 | null | 强制结构化输出，目前仅 `{type: "json_object"}` 用于多文件修改场景 |
+| retrieval_config | RetrievalConfig | 否 | null | 自动检索配置，开启后后端用混合检索器注入相关代码片段 |
+| inline_selection | InlineSelection | 否 | null | Inline Chat 选中代码范围（mode='inline' 时使用） |
+| response_format | ResponseFormat | 否 | null | 强制结构化输出，目前仅 `{type: "json_object"}` 用于多文件修改场景 |
 
 #### ChatMessage 结构
 
@@ -269,8 +273,8 @@ Content-Type: application/json
 ```json
 {
   "type": "file",
-  "filePath": "src/main.py",
-  "contentSnippet": "...",
+  "file_path": "src/main.py",
+  "content_snippet": "...",
   "language": "python"
 }
 ```
@@ -278,34 +282,34 @@ Content-Type: application/json
 | 字段 | 类型 | 必需 | 描述 |
 |------|------|------|------|
 | type | string | 是 | `file` 用户主动 @ 的文件 / `selection` 选中的代码片段 / `implicit` 插件附带的当前激活文件 |
-| filePath | string | 是 | 文件相对路径，非空字符串 |
-| contentSnippet | string | 是 | 已截断的文件/代码片段内容，单条上限 50000 字符 |
+| file_path | string | 是 | 文件相对路径，非空字符串 |
+| content_snippet | string | 是 | 已截断的文件/代码片段内容，单条上限 50000 字符 |
 | language | string | 否 | 文件语言（如 python / javascript） |
 
 #### RetrievalConfig 结构
 
 ```json
 {
-  "autoContext": true,
-  "topK": 5,
-  "includeReferences": true
+  "auto_context": true,
+  "top_k": 5,
+  "include_references": true
 }
 ```
 
 | 字段 | 类型 | 默认值 | 描述 |
 |------|------|--------|------|
-| autoContext | boolean | true | 是否自动从索引中检索相关代码注入 Prompt |
-| topK | number | 5 | 注入 Prompt 的片段数（1~20） |
-| includeReferences | boolean | true | SSE 流中是否返回 references 元数据块 |
+| auto_context | boolean | true | 是否自动从索引中检索相关代码注入 Prompt |
+| top_k | number | 5 | 注入 Prompt 的片段数（1~20） |
+| include_references | boolean | true | SSE 流中是否返回 references 元数据块 |
 
 #### InlineSelection 结构（mode='inline'）
 
 ```json
 {
-  "filePath": "src/main.py",
-  "selectedText": "def hello(): pass",
-  "startLine": 10,
-  "endLine": 12
+  "file_path": "src/main.py",
+  "selected_text": "def hello(): pass",
+  "start_line": 10,
+  "end_line": 12
 }
 ```
 
@@ -322,17 +326,17 @@ Content-Type: application/json
 ⚠️ **大文件截断必须在插件端完成**，后端只做防御性校验：
 
 - **截断策略**：只取头尾各 200 行 + 光标所在行附近 50 行
-- **后端防御**：单条 `contentSnippet` 超过 50000 字符时返回 422
+- **后端防御**：单条 `content_snippet` 超过 50000 字符时返回 422
 - **Token 计数**：使用 `tiktoken` 的 `cl100k_base` 编码精确计数
 - **丢弃优先级**：用户主动 @ 的（file/selection）保留，implicit 自动附带的优先截断
-- **JSON Mode 风险**：`responseFormat=json_object` 时独立超时 30 秒，超过返回友好提示
+- **JSON Mode 风险**：`response_format=json_object` 时独立超时 30 秒，超过返回友好提示
 
 #### 会话管理
 
 - **滑动窗口裁剪**：保留 System 消息 + 最近 5 轮对话
 - **Token 预算**：总预算 8000 tokens，20% 余量触发裁剪
 - **会话过期**：默认 1 小时无活动后自动清理
-- **无状态兼容**：不携带 `sessionId` 时按请求 messages 直接透传
+- **无状态兼容**：不携带 `session_id` 时按请求 messages 直接透传
 
 #### 流式响应（SSE）
 
@@ -357,7 +361,7 @@ data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1699999999
 
 ```
 data: {"type":"diff","files":[
-  {"path":"src/main.py","oldContent":"def hello(): pass","newContent":"def hello(): print('hi')","diff":"@@ ..."}
+  {"path":"src/main.py","old_content":"def hello(): pass","new_content":"def hello(): print('hi')","diff":"@@ ..."}
 ]}
 ```
 
@@ -382,7 +386,7 @@ data: {"error":{"code":10201,"msg":"服务器内部错误"}}
 - `200`: 请求成功（流式响应）
 - `400`: 请求参数错误
 - `401`: 未认证或令牌无效
-- `422`: 参数校验失败（如 contentSnippet 过长）
+- `422`: 参数校验失败（如 content_snippet 过长）
 - `429`: 限频超限
 - `500`: 服务器内部错误
 - `503`: 适配器不可用
@@ -405,11 +409,11 @@ Authorization: Bearer {accessToken}
 
 ```json
 {
-  "userId": "a1b2c3d4e5f6...",
-  "usedTokensToday": 12500,
-  "quotaLimitPerDay": 100000,
+  "user_id": "a1b2c3d4e5f6...",
+  "used_tokens_today": 12500,
+  "quota_limit_per_day": 100000,
   "percentage": 0.125,
-  "resetAt": "2026-10-06T00:00:00Z"
+  "reset_at": "2026-10-06T00:00:00Z"
 }
 ```
 
@@ -417,11 +421,11 @@ Authorization: Bearer {accessToken}
 
 | 字段 | 类型 | 描述 |
 |------|------|------|
-| userId | string | 用户标识（JWT sub 字段的哈希值） |
-| usedTokensToday | number | 今日已消耗 Token 数 |
-| quotaLimitPerDay | number | 每日 Token 配额上限（默认 100000） |
+| user_id | string | 用户标识（JWT sub 字段的哈希值） |
+| used_tokens_today | number | 今日已消耗 Token 数 |
+| quota_limit_per_day | number | 每日 Token 配额上限（默认 100000） |
 | percentage | number | 已用比例（0.0 ~ 1.0） |
-| resetAt | string | 配额重置时间（ISO 8601，UTC 午夜） |
+| reset_at | string | 配额重置时间（ISO 8601，UTC 午夜） |
 
 ---
 
@@ -441,9 +445,9 @@ Authorization: Bearer {accessToken}
 
 ```json
 [
-  {"id": "glm-4.5-air", "label": "ZAI GLM-4.5 Air", "contextWindow": 128000},
-  {"id": "deepseek-v3", "label": "DeepSeek V3", "contextWindow": 64000},
-  {"id": "gpt-4o", "label": "GPT-4o", "contextWindow": 128000}
+  {"id": "glm-4.5-air", "label": "ZAI GLM-4.5 Air", "context_window": 128000},
+  {"id": "deepseek-v3", "label": "DeepSeek V3", "context_window": 64000},
+  {"id": "gpt-4o", "label": "GPT-4o", "context_window": 128000}
 ]
 ```
 
@@ -466,24 +470,24 @@ Content-Type: application/json
 
 ```json
 {
-  "workspaceRoot": "/path/to/workspace",
-  "forceRebuild": false,
-  "priorityFiles": ["src/main.py"]
+  "workspace_root": "/path/to/workspace",
+  "force_rebuild": false,
+  "priority_files": ["src/main.py"]
 }
 ```
 
 | 字段 | 类型 | 必需 | 默认值 | 描述 |
 |------|------|------|--------|------|
-| workspaceRoot | string | 是 | - | 工作区根路径 |
-| forceRebuild | boolean | 否 | false | 是否强制重建索引 |
-| priorityFiles | Array[string] | 否 | null | 优先索引的文件列表（即用即索引） |
+| workspace_root | string | 是 | - | 工作区根路径 |
+| force_rebuild | boolean | 否 | false | 是否强制重建索引 |
+| priority_files | Array[string] | 否 | null | 优先索引的文件列表（即用即索引） |
 
 #### 响应
 
 ```json
 {
-  "jobId": "idx_abc123",
-  "totalFiles": 1523
+  "job_id": "idx_abc123",
+  "total_files": 1523
 }
 ```
 
@@ -503,7 +507,7 @@ Content-Type: application/json
   "total": 1523,
   "processed": 876,
   "percentage": 0.575,
-  "totalSymbols": 3420,
+  "total_symbols": 3420,
   "message": null
 }
 ```
@@ -527,14 +531,14 @@ Content-Type: application/json
 
 ```json
 {
-  "filePath": "src/main.py",
+  "file_path": "src/main.py",
   "action": "modified"
 }
 ```
 
 | 字段 | 类型 | 必需 | 描述 |
 |------|------|------|------|
-| filePath | string | 是 | 变更的文件路径（相对路径） |
+| file_path | string | 是 | 变更的文件路径（相对路径） |
 | action | string | 是 | `modified` / `deleted` / `renamed` |
 
 #### 响应
@@ -543,7 +547,7 @@ Content-Type: application/json
 {
   "success": true,
   "message": "更新成功",
-  "symbolsCount": 24
+  "symbols_count": 24
 }
 ```
 
@@ -567,17 +571,17 @@ Content-Type: application/json
 ```json
 {
   "query": "排序函数",
-  "topK": 10,
+  "top_k": 10,
   "total": 5,
   "results": [
     {
       "id": "chunk_001",
-      "filePath": "src/utils.py",
-      "symbolName": "sort_data",
-      "chunkType": "function",
+      "file_path": "src/utils.py",
+      "symbol_name": "sort_data",
+      "chunk_type": "function",
       "content": "def sort_data(arr): return sorted(arr)",
-      "startLine": 10,
-      "endLine": 12,
+      "start_line": 10,
+      "end_line": 12,
       "distance": 0.34,
       "score": 0.82
     }
@@ -606,10 +610,10 @@ BFS 遍历查询与指定文件强关联的上下游文件。
 
 ```json
 {
-  "filePath": "src/main.py",
+  "file_path": "src/main.py",
   "depth": 2,
   "upstream": [
-    {"filePath": "src/utils.py", "direction": "upstream", "depth": 1, "edge": {"source": "src/main.py", "target": "src/utils.py", "edgeType": "import", "line": 3}}
+    {"file_path": "src/utils.py", "direction": "upstream", "depth": 1, "edge": {"source": "src/main.py", "target": "src/utils.py", "edge_type": "import", "line": 3}}
   ],
   "downstream": [],
   "total": 1
@@ -628,10 +632,10 @@ BFS 遍历查询与指定文件强关联的上下游文件。
 
 ```json
 {
-  "filePath": "src/main.py",
+  "file_path": "src/main.py",
   "imports": [
-    {"filePath": "src/utils.py", "moduleName": "utils", "line": 3, "resolved": true},
-    {"filePath": null, "moduleName": "os", "line": 2, "resolved": false}
+    {"file_path": "src/utils.py", "module_name": "utils", "line": 3, "resolved": true},
+    {"file_path": null, "module_name": "os", "line": 2, "resolved": false}
   ]
 }
 ```
@@ -670,8 +674,8 @@ BFS 遍历查询与指定文件强关联的上下游文件。
   "limit": 10,
   "total": 3,
   "symbols": [
-    {"name": "DataProcessor", "type": "class", "filePath": "src/processor.py", "line": 10},
-    {"name": "DatabaseConnector", "type": "class", "filePath": "src/db.py", "line": 20}
+    {"name": "DataProcessor", "type": "class", "file_path": "src/processor.py", "line": 10},
+    {"name": "DatabaseConnector", "type": "class", "file_path": "src/db.py", "line": 20}
   ]
 }
 ```
@@ -690,9 +694,9 @@ BFS 遍历查询与指定文件强关联的上下游文件。
 {
   "name": "DataProcessor",
   "type": "class",
-  "filePath": "src/processor.py",
-  "startLine": 10,
-  "endLine": 45
+  "file_path": "src/processor.py",
+  "start_line": 10,
+  "end_line": 45
 }
 ```
 
@@ -708,11 +712,11 @@ BFS 遍历查询与指定文件强关联的上下游文件。
 
 ```json
 {
-  "symbolName": "save",
+  "symbol_name": "save",
   "total": 2,
   "callers": [
-    {"filePath": "src/main.py", "callerSymbol": "process_data", "line": 15, "raw": "db.save()"},
-    {"filePath": "src/utils.py", "callerSymbol": "", "line": 88, "raw": "repo.save(obj)"}
+    {"file_path": "src/main.py", "caller_symbol": "process_data", "line": 15, "raw": "db.save()"},
+    {"file_path": "src/utils.py", "caller_symbol": "", "line": 88, "raw": "repo.save(obj)"}
   ]
 }
 ```
@@ -729,19 +733,19 @@ BFS 遍历查询与指定文件强关联的上下游文件。
 
 ```json
 {
-  "filePath": "src/UserService.js",
-  "modifiedLine": 22,
+  "file_path": "src/UserService.js",
+  "modified_line": 22,
   "action": "rename",
-  "symbolName": "getUser"
+  "symbol_name": "getUser"
 }
 ```
 
 | 字段 | 类型 | 必需 | 描述 |
 |------|------|------|------|
-| filePath | string | 是 | 用户当前编辑的文件路径 |
-| modifiedLine | number | 是 | 被改动的行号（1-based） |
+| file_path | string | 是 | 用户当前编辑的文件路径 |
+| modified_line | number | 是 | 被改动的行号（1-based） |
 | action | string | 是 | `rename` / `delete` / `add_method` |
-| symbolName | string | 是 | 被改名的符号名 |
+| symbol_name | string | 是 | 被改名的符号名 |
 
 #### 三种 action 对应规则
 
@@ -754,10 +758,10 @@ BFS 遍历查询与指定文件强关联的上下游文件。
 ```json
 {
   "action": "rename",
-  "symbolName": "getUser",
+  "symbol_name": "getUser",
   "total": 1,
   "suggestions": [
-    {"filePath": "src/AdminService.js", "line": 18, "reason": "此函数调用了被改名的符号"}
+    {"file_path": "src/AdminService.js", "line": 18, "reason": "此函数调用了被改名的符号"}
   ]
 }
 ```
@@ -777,7 +781,7 @@ BFS 遍历查询与指定文件强关联的上下游文件。
 ```json
 {
   "goal": "给项目添加用户登录功能",
-  "workspaceRoot": "/path/to/workspace",
+  "workspace_root": "/path/to/workspace",
   "model": "glm-4.5-air",
   "plan": null
 }
@@ -786,7 +790,7 @@ BFS 遍历查询与指定文件强关联的上下游文件。
 | 字段 | 类型 | 必需 | 描述 |
 |------|------|------|------|
 | goal | string | 是 | 自然语言需求描述 |
-| workspaceRoot | string | 是 | 工作区根路径 |
+| workspace_root | string | 是 | 工作区根路径 |
 | model | string | 否 | 使用的模型 |
 | plan | Array[Step] | 否 | 预拆解的步骤列表（不传则由 Planner 自动生成） |
 
@@ -794,8 +798,8 @@ BFS 遍历查询与指定文件强关联的上下游文件。
 
 ```json
 {
-  "sessionId": "agent_sess_001",
-  "planPreview": [
+  "session_id": "agent_sess_001",
+  "plan_preview": [
     {"id": "step_1", "description": "分析现有代码结构"},
     {"id": "step_2", "description": "创建 User 模型"}
   ]
@@ -806,36 +810,36 @@ BFS 遍历查询与指定文件强关联的上下游文件。
 
 ### 21. Agent - 查询状态
 
-**GET** `/v1/agent/status/{sessionId}`
+**GET** `/v1/agent/status/{session_id}`
 
 查询 Agent 会话完整状态，供 Builder 面板轮询。
 
 #### 路径参数
 
-- `sessionId`: Agent 会话 ID
+- `session_id`: Agent 会话 ID
 
 #### 响应（部分字段）
 
 ```json
 {
-  "sessionId": "agent_sess_001",
-  "userGoal": "给项目添加用户登录功能",
-  "workspaceRoot": "/path/to/workspace",
-  "currentStepIndex": 2,
+  "session_id": "agent_sess_001",
+  "user_goal": "给项目添加用户登录功能",
+  "workspace_root": "/path/to/workspace",
+  "current_step_index": 2,
   "progress": 0.4,
-  "progressPercent": 40,
-  "isExecuting": true,
-  "isPaused": false,
-  "pendingQuestion": null,
-  "pendingConfirmationId": null,
-  "pendingConfirmationTool": null,
-  "endReason": null,
-  "totalRetriesUsed": 0,
-  "testResults": null
+  "progress_percent": 40,
+  "is_executing": true,
+  "is_paused": false,
+  "pending_question": null,
+  "pending_confirmation_id": null,
+  "pending_confirmation_tool": null,
+  "end_reason": null,
+  "total_retries_used": 0,
+  "test_results": null
 }
 ```
 
-#### endReason 枚举（终态）
+#### end_reason 枚举（终态）
 
 - `"completed"`: 正常完成
 - `"max_iter"`: 超过最大迭代次数
@@ -847,7 +851,7 @@ BFS 遍历查询与指定文件强关联的上下游文件。
 
 ### 22. Agent - 启动执行
 
-**POST** `/v1/agent/start/{sessionId}`
+**POST** `/v1/agent/start/{session_id}`
 
 启动 ReAct 执行循环（后台 asyncio.Task，立即返回）。
 
@@ -864,7 +868,7 @@ BFS 遍历查询与指定文件强关联的上下游文件。
 
 ### 23. Agent - 暂停执行
 
-**POST** `/v1/agent/pause/{sessionId}`
+**POST** `/v1/agent/pause/{session_id}`
 
 暂停 ReAct 循环。
 
@@ -872,7 +876,7 @@ BFS 遍历查询与指定文件强关联的上下游文件。
 
 ### 24. Agent - 恢复执行
 
-**POST** `/v1/agent/resume/{sessionId}`
+**POST** `/v1/agent/resume/{session_id}`
 
 恢复 ReAct 循环。
 
@@ -888,7 +892,7 @@ Agent 返回 ask_user 工具暂停后，用户提交回答。
 
 ```json
 {
-  "sessionId": "agent_sess_001",
+  "session_id": "agent_sess_001",
   "answer": "好的，使用 JWT 认证"
 }
 ```
@@ -905,16 +909,16 @@ Agent 执行 write_file / run_command / git_commit 等需要确认的工具时�
 
 ```json
 {
-  "sessionId": "agent_sess_001",
-  "confirmationId": "confirm_abc123",
+  "session_id": "agent_sess_001",
+  "confirmation_id": "confirm_abc123",
   "action": "allow"
 }
 ```
 
 | 字段 | 类型 | 必需 | 描述 |
 |------|------|------|------|
-| sessionId | string | 是 | Agent 会话 ID |
-| confirmationId | string | 是 | 待确认操作的 ID |
+| session_id | string | 是 | Agent 会话 ID |
+| confirmation_id | string | 是 | 待确认操作的 ID |
 | action | string | 是 | `allow` 允许 / `deny` 拒绝 |
 
 #### 响应
@@ -923,7 +927,7 @@ Agent 执行 write_file / run_command / git_commit 等需要确认的工具时�
 {
   "success": true,
   "message": "已允许工具执行，Agent 继续运行",
-  "resultSummary": "写入 src/main.py 成功"
+  "result_summary": "写入 src/main.py 成功"
 }
 ```
 
@@ -933,14 +937,14 @@ Agent 执行 write_file / run_command / git_commit 等需要确认的工具时�
 
 **POST** `/v1/tool/execute`
 
-执行工具调用。只读工具直接执行并返回；写操作（write_file / run_command / git_commit）返回 `requiresConfirmation=true` + confirmationId。
+执行工具调用。只读工具直接执行并返回；写操作（write_file / run_command / git_commit）返回 `requires_confirmation=true` + confirmation_id。
 
 #### 请求体
 
 ```json
 {
-  "sessionId": "agent_sess_001",
-  "toolCall": {
+  "session_id": "agent_sess_001",
+  "tool_call": {
     "name": "read_file",
     "arguments": {"file_path": "src/main.py"}
   }
@@ -952,8 +956,8 @@ Agent 执行 write_file / run_command / git_commit 等需要确认的工具时�
 ```json
 {
   "success": true,
-  "requiresConfirmation": false,
-  "toolName": "read_file",
+  "requires_confirmation": false,
+  "tool_name": "read_file",
   "output": {"content": "...", "lines": 150}
 }
 ```
@@ -963,9 +967,9 @@ Agent 执行 write_file / run_command / git_commit 等需要确认的工具时�
 ```json
 {
   "success": false,
-  "requiresConfirmation": true,
-  "confirmationId": "confirm_xyz789",
-  "toolName": "write_file",
+  "requires_confirmation": true,
+  "confirmation_id": "confirm_xyz789",
+  "tool_name": "write_file",
   "output": null
 }
 ```
@@ -982,8 +986,8 @@ Agent 执行 write_file / run_command / git_commit 等需要确认的工具时�
 
 ```json
 {
-  "sessionId": "agent_sess_001",
-  "confirmationId": "confirm_xyz789",
+  "session_id": "agent_sess_001",
+  "confirmation_id": "confirm_xyz789",
   "action": "allow"
 }
 ```
@@ -992,14 +996,14 @@ Agent 执行 write_file / run_command / git_commit 等需要确认的工具时�
 
 ### 29. 终端日志流式（WebSocket）
 
-**WS** `/v1/agent/stream/{sessionId}`
+**WS** `/v1/agent/stream/{session_id}`
 
 命令执行时的实时 stdout/stderr/system 消息流。前端在调用 tool/confirm 前先建立连接。
 
 #### 连接
 
 ```
-ws://localhost:3000/v1/agent/stream/{sessionId}
+ws://localhost:3000/v1/agent/stream/{session_id}
 ```
 
 #### 消息格式
@@ -1026,20 +1030,20 @@ ws://localhost:3000/v1/agent/stream/{sessionId}
 
 ```json
 {
-  "configuredMode": "docker",
-  "activeMode": "host",
-  "dockerAvailable": false,
-  "fuseLimit": 3,
-  "safetyInfo": {
-    "defaultTimeoutSeconds": 60,
-    "maxTimeoutSeconds": 300,
-    "dangerPatternsCount": 5,
-    "networkDisabled": true,
-    "memoryLimitMb": 512,
-    "cpuLimit": 0.5,
-    "allowHostGateway": false
+  "configured_mode": "docker",
+  "active_mode": "host",
+  "docker_available": false,
+  "fuse_limit": 3,
+  "safety_info": {
+    "default_timeout_seconds": 60,
+    "max_timeout_seconds": 300,
+    "danger_patterns_count": 5,
+    "network_disabled": true,
+    "memory_limit_mb": 512,
+    "cpu_limit": 0.5,
+    "allow_host_gateway": false
   },
-  "degradationWarning": "配置了 SANDBOX_MODE=docker 但 Docker 不可用，已自动降级到 host 模式"
+  "degradation_warning": "配置了 SANDBOX_MODE=docker 但 Docker 不可用，已自动降级到 host 模式"
 }
 ```
 
@@ -1085,7 +1089,7 @@ ws://localhost:3000/v1/agent/stream/{sessionId}
 | 401 | 未认证或令牌无效 / API Key 无效 |
 | 404 | 资源不存在（如 Agent 会话 / 符号定义） |
 | 409 | 资源冲突（如代码库尚未索引） |
-| 422 | 请求参数校验失败（如 contentSnippet 过长） |
+| 422 | 请求参数校验失败（如 content_snippet 过长） |
 | 429 | 限频超限 |
 | 500 | 服务器内部错误 |
 | 502 | Planner 生成任务计划失败 |
@@ -1136,13 +1140,13 @@ curl -X POST "http://localhost:3000/v1/chat/completions" \
              {"role": "user", "content": "给 main.py 加一个 greet 函数"}
          ],
          "mode": "inline",
-         "inlineSelection": {
-             "filePath": "src/main.py",
-             "selectedText": "def hello(): pass",
-             "startLine": 10,
-             "endLine": 10
+         "inline_selection": {
+             "file_path": "src/main.py",
+             "selected_text": "def hello(): pass",
+             "start_line": 10,
+             "end_line": 10
          },
-         "responseFormat": {"type": "json_object"},
+         "response_format": {"type": "json_object"},
          "stream": true
      }'
 
@@ -1150,7 +1154,7 @@ curl -X POST "http://localhost:3000/v1/chat/completions" \
 curl -X POST "http://localhost:3000/v1/index/start" \
      -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIs..." \
      -H "Content-Type: application/json" \
-     -d '{"workspaceRoot": "/path/to/project"}'
+     -d '{"workspace_root": "/path/to/project"}'
 
 # 5. 查询用量
 curl -X GET "http://localhost:3000/v1/user/usage" \
@@ -1160,7 +1164,7 @@ curl -X GET "http://localhost:3000/v1/user/usage" \
 curl -X POST "http://localhost:3000/v1/agent/plan" \
      -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIs..." \
      -H "Content-Type: application/json" \
-     -d '{"goal": "给项目加日志功能", "workspaceRoot": "/path/to/project"}'
+     -d '{"goal": "给项目加日志功能", "workspace_root": "/path/to/project"}'
 
 curl -X POST "http://localhost:3000/v1/agent/start/{session_id}" \
      -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIs..."
@@ -1182,11 +1186,11 @@ async function chatInlineChat() {
     body: JSON.stringify({
       messages: [{ role: 'user', content: '把 hello 改成 greet' }],
       mode: 'inline',
-      inlineSelection: {
-        filePath: 'src/main.py',
-        selectedText: 'def hello(): pass',
-        startLine: 10,
-        endLine: 10
+      inline_selection: {
+        file_path: 'src/main.py',
+        selected_text: 'def hello(): pass',
+        start_line: 10,
+        end_line: 10
       },
       stream: true
     })
