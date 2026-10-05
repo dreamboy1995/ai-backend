@@ -565,7 +565,17 @@ Content-Type: application/json
 
 **GET** `/v1/index/status`
 
-查询当前索引进度、状态、符号总数等。
+查询当前索引进度、状态、符号总数等。插件前端轮询此接口展示索引进度条。
+
+#### 请求头
+
+```
+Authorization: Bearer {accessToken}
+```
+
+#### 请求参数
+
+无（纯 GET，无查询参数、无请求体）。
 
 #### 响应
 
@@ -580,12 +590,37 @@ Content-Type: application/json
 }
 ```
 
+#### 响应字段说明
+
+| 字段 | 类型 | 默认值 | 描述 |
+|------|------|--------|------|
+| status | string | `"idle"` | 索引状态，枚举值见下方 |
+| total | number | `0` | 待处理文件总数 |
+| processed | number | `0` | 已处理文件数 |
+| percentage | float | `0.0` | 进度比例 0.0 ~ 1.0（前端展示时 × 100 转百分比） |
+| total_symbols | number | `0` | 已索引的符号总数（函数、类、变量等） |
+| message | string \| null | `null` | 状态描述信息；`status=error` 时为错误原因，`status=done` 时为完成摘要 |
+
 #### status 枚举值
 
-- `"idle"`: 空闲，尚未开始
-- `"indexing"`: 正在索引
-- `"done"`: 完成
-- `"error"`: 出错
+| 值 | 描述 | 典型触发场景 |
+|----|------|-------------|
+| `"idle"` | 空闲，尚未开始 | 后端刚启动、尚未触发过索引 |
+| `"indexing"` | 正在索引 | 调用 `POST /v1/index/start` 后，后台线程正在扫描解析 |
+| `"done"` | 完成 | 全量索引结束，或后端从 `.ai_index/symbols.json` 快速恢复成功 |
+| `"error"` | 出错 | 工作区路径不存在、索引启动异常等 |
+
+#### 特殊行为
+
+- **Redis 优先，内存降级**：索引进度每处理一个文件写入一次 Redis（`index:status:{job_id}`），查询时优先读取 Redis 中的最新状态。Redis 不可用或未开启时，自动降级为内存中的 `IndexService` 状态。多实例部署场景下必须开启 Redis，否则各实例进度不共享。
+- **快速恢复状态**：若后端从 `.ai_index/symbols.json` 恢复成功（未强制重建），`status` 直接置为 `"done"`，`message` 为 "索引已从磁盘恢复，共 N 个符号"，前端应跳过进度条直接显示完成。
+- **percentage 计算规则**：`processed / total`，保留 4 位小数；`total=0` 时返回 0.0。前端自行 `* 100` 转为百分比显示。
+- **无 job_id 过滤**：当前实现中 `IndexService` 为单例，只维护"当前索引"状态，不支持多 job 并行查询。后端重启后状态重置为 `idle`，除非触发快速恢复。
+
+#### 状态码
+
+- `200`: 查询成功
+- `401`: 未认证 / 令牌无效
 
 ---
 
@@ -593,7 +628,14 @@ Content-Type: application/json
 
 **POST** `/v1/index/update`
 
-由插件在文件保存/删除/重命名时调用，仅重新处理该文件。
+由插件在文件保存/删除/重命名时调用，仅重新处理该文件。复用首次索引时缓存的 `workspace_root`，无需插件每次传入。
+
+#### 请求头
+
+```
+Authorization: Bearer {accessToken}
+Content-Type: application/json
+```
 
 #### 请求体
 
@@ -606,7 +648,7 @@ Content-Type: application/json
 
 | 字段 | 类型 | 必需 | 描述 |
 |------|------|------|------|
-| file_path | string | 是 | 变更的文件路径（相对路径） |
+| file_path | string | 是 | 变更的文件路径（相对路径），自动归一化为 POSIX 正斜杠；若路径不在 `workspace_root` 内则拒绝处理 |
 | action | string | 是 | `modified` / `deleted` / `renamed` |
 
 #### 响应
@@ -614,10 +656,30 @@ Content-Type: application/json
 ```json
 {
   "success": true,
-  "message": "更新成功",
+  "message": "已更新 src/main.py 的索引",
   "symbols_count": 24
 }
 ```
+
+#### 响应字段说明
+
+| 字段 | 类型 | 默认值 | 描述 |
+|------|------|--------|------|
+| success | boolean | - | 是否更新成功 |
+| message | string | - | 更新结果的描述信息 |
+| symbols_count | number | `0` | 该文件的符号数量（`deleted` 时恒为 0，`modified`/`renamed` 时为更新后的符号数） |
+
+#### 特殊行为
+
+- **路径安全校验**：后端对 `file_path` 做 `workspace_root` 范围校验，若路径指向工作区外（如系统临时目录或含 `..` 逃逸），直接返回 `success=false` 并跳过处理，避免向量库被污染。
+- **BM25 标记脏数据**：每次增量更新后，BM25 索引标记为脏数据，下次检索时自动全量重建。
+- **检索缓存失效**：增量更新后自动清空 hybrid_search 的结果缓存，避免返回过期检索结果。
+
+#### 状态码
+
+- `200`: 更新成功（或文件被跳过但路径安全校验已通过时也返回 200，`success=false`）
+- `400`: 请求参数错误 / 文件不存在 / 路径不在工作区内
+- `401`: 未认证 / 令牌无效
 
 ---
 
