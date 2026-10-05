@@ -667,14 +667,15 @@ async def repair_loop(
     success = False
 
     for attempt in range(1, max_retries + 1):
-        # ---- 全局熔断二次检查（修复过程中 total 可能被其他步骤消耗）----
+        # ---- 全局熔断检查（每次 attempt 开始前）----
+        # 累加逻辑改为每次 attempt 后立即累加，确保下次 attempt 能感知到额度消耗。
+        # 这样循环中途就能触发熔断，而不是等到函数结束一次性累加。
         if session.total_retries_used >= session.max_total_retries:
             logger.warning(
                 f"[SelfRepair] 全局熔断触发：session.total_retries_used="
                 f"{session.total_retries_used}/{session.max_total_retries}，"
                 f"终止 step={step.id} 的自修复"
             )
-            # 记录一条 fused 状态的 RepairAttempt
             ra = RepairAttempt(
                 step_id=step.id,
                 attempt_number=attempt,
@@ -728,6 +729,8 @@ async def repair_loop(
             )
             step.repair_history.append(ra)
             await _publish_repair_attempt(session.session_id, ra)
+            # ---- 累加：LLM 调用虽然没返回合法 action，但也消耗了一次尝试 ----
+            session.total_retries_used += 1
             last_verify_error = "LLM 未返回合法修复方案"
             continue
 
@@ -839,8 +842,8 @@ async def repair_loop(
                 f"observation={verify_result.output[:100] if verify_result.output else '(无)'}"
             )
             success = True
-            # 累加全局重试次数（成功也算消耗了 attempt 次机会）
-            session.total_retries_used += attempt
+            # ---- 累加全局重试次数（每次 attempt 立即累加，便于后续熔断检查感知）----
+            session.total_retries_used += 1
             step.retry_count = attempt
             step.repair_history.append(ra)
             await _publish_repair_attempt(session.session_id, ra)
@@ -848,10 +851,10 @@ async def repair_loop(
                 f"[SelfRepair] ✅ 修复成功 step={step.id}: "
                 f"Retry {attempt}/{max_retries} success"
             )
-            # 更新最后 parsed error
             return True, verify_result.output or f"工具 {step.action} 执行成功（自修复后）"
 
-        # 本次修复仍失败
+        # ---- 本次修复仍失败：当前 attempt 已消耗一个额度，立即累加 ----
+        session.total_retries_used += 1
         ra.result = "failed"
         ra.result_summary = (
             f"修复后验证仍失败。最新错误: "
@@ -908,8 +911,8 @@ async def repair_loop(
         )
 
     # ---- 循环结束：失败 ----
-    # 累加全局重试次数
-    session.total_retries_used += attempt
+    # 注意：total_retries_used 已在每次 attempt 结束后立即累加过了，
+    # 这里不再重复累加。step.retry_count 需要按实际执行的次数设置。
     step.retry_count = attempt
     step.last_parsed_error = parsed_error.model_dump()
 

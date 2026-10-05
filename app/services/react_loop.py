@@ -685,6 +685,16 @@ async def run_agent(
             # ---- Observe（观察）----
             observation = result.output or f"工具 {tool} 执行成功"
 
+            # S9 第 85-86 天：run_tests 工具返回 dict output（含 summary 和 test_result）
+            # 需要提取其中的 summary 作为可读 observation，避免 dict[:80] 切片报错
+            # 也避免 step.observation（字符串字段）被写成 dict 导致 Pydantic 校验失败
+            if isinstance(observation, dict):
+                summary = observation.get("summary") or ""
+                if summary:
+                    observation = summary
+                else:
+                    observation = json.dumps(observation, ensure_ascii=False)
+
             if result.requires_interaction:
                 # 需要用户手动执行（如 python REPL / npm init 无 --yes）
                 # 不计入连续失败——这是正常的"需要人工介入"场景，不是 Agent 执行失败
