@@ -454,21 +454,49 @@ Authorization: Bearer {accessToken}
 
 获取可用模型列表，供设置面板下拉框使用。
 
+> ⚠️ **注意**：返回的是所有在后端注册的模型（无论对应厂商 API Key 是否已配置），前端可据此展示全部可选项。但实际调用 `/v1/chat/completions` 时，若所选模型的厂商 Key 未配置，会收到 503 错误。
+
 #### 请求头
 
 ```
 Authorization: Bearer {accessToken}
 ```
 
+#### 请求参数
+
+无（纯 GET，无请求体）。
+
 #### 响应
 
 ```json
 [
-  {"id": "glm-4.5-air", "label": "ZAI GLM-4.5 Air", "context_window": 128000},
+  {"id": "glm-4.5-air", "label": "GLM-4.5 Air", "context_window": 128000},
   {"id": "deepseek-v3", "label": "DeepSeek V3", "context_window": 64000},
-  {"id": "gpt-4o", "label": "GPT-4o", "context_window": 128000}
+  {"id": "gpt-4o", "label": "GPT-4o", "context_window": 128000},
+  {"id": "claude-3.5-sonnet", "label": "Claude 3.5 Sonnet", "context_window": 200000}
 ]
 ```
+
+#### 字段说明
+
+响应为 `ModelItem` 对象数组，每个元素字段如下：
+
+| 字段 | 类型 | 描述 |
+|------|------|------|
+| id | string | 模型唯一标识（请求 `/v1/chat/completions` 时 `model` 字段应传此值） |
+| label | string | 展示名称（设置面板下拉框显示用） |
+| context_window | number | 最大上下文窗口大小（token 数） |
+
+> **当前已注册模型**：
+> - `glm-4.5-air` — GLM-4.5 Air（ZAI 厂商，默认模型）
+> - `deepseek-v3` — DeepSeek V3（DeepSeek 厂商）
+> - `gpt-4o` — GPT-4o（OpenAI 厂商）
+> - `claude-3.5-sonnet` — Claude 3.5 Sonnet（Anthropic 厂商）
+
+#### 状态码
+
+- `200`: 查询成功
+- `401`: 未认证 / 令牌无效
 
 ---
 
@@ -509,6 +537,27 @@ Content-Type: application/json
   "total_files": 1523
 }
 ```
+
+#### 响应字段说明
+
+| 字段 | 类型 | 描述 |
+|------|------|------|
+| job_id | string | 本次索引任务的唯一标识（UUID），用于后续进度查询与状态跟踪 |
+| total_files | number | 工作区扫描到的待索引文件总数（含优先文件） |
+
+#### 特殊行为
+
+- **重复调用**：若当前已有索引任务在进行中（`status=indexing`），后端不会重复启动，而是返回正在执行中的 `job_id` 和已扫描的文件总数。
+- **快速恢复**：若工作区存在已持久化的符号表（`.ai_index/symbols.json`）且未设 `force_rebuild=true`，后端直接从磁盘加载符号表，跳过全量扫描流程，立即置为 `done` 状态。
+- **后台执行**：索引任务在后台线程异步执行，HTTP 请求立即返回不阻塞，进度需通过 `GET /v1/index/status` 轮询查询。
+
+#### 状态码
+
+- `200`: 索引任务已成功启动（或已在执行中）
+- `400`: `workspace_root` 为空或路径不存在
+- `401`: 未认证 / 令牌无效
+- `429`: 限频超限
+- `500`: 索引启动过程中发生内部错误
 
 ---
 
