@@ -177,6 +177,8 @@ async def get_status(session_id: str):
         # S9 第 83-84 天：全局自修复熔断状态
         total_retries_used=session.total_retries_used,
         max_total_retries=session.max_total_retries,
+        # S9 第 85-86 天：测试沙箱集成
+        test_results=session.test_results,
     )
 
 

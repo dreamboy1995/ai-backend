@@ -232,6 +232,14 @@ class AgentSession(BaseModel):
         default=20, ge=1,
         description="全局熔断阈值：超过此值强制终止 Agent（默认 20）",
     )
+    # S9 第 85-86 天：测试沙箱集成
+    # 每次 run_tests（自修复自动触发 或 Agent 主动调用）的完整结构化结果。
+    # 列表结构：[{"success": bool, "output": str, "failures": [{test_name, error, file, line}], ...}]
+    # 格式与 GET /v1/agent/status 响应体 test_results 字段一致。
+    test_results: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="测试执行结果历史（每次 run_tests 追加一条，供前端 Builder 面板渲染测试时间线）",
+    )
     # 会话结束原因与描述（持久化到 Redis，供前端判断会话是否已死亡）
     # 取值见 END_REASON_* 常量；None 表示运行中或未开始
     end_reason: Optional[str] = Field(default=None, description="会话结束原因")
@@ -341,6 +349,11 @@ class AgentStatusResponse(BaseModel):
     # S9 第 83-84 天：全局自修复熔断状态（前端展示"已消耗 N/20 次修复机会"）
     total_retries_used: int = Field(default=0, description="全局累计自修复尝试次数")
     max_total_retries: int = Field(default=20, description="全局修复熔断阈值")
+    # S9 第 85-86 天：测试沙箱集成（前端 Builder 面板渲染测试时间线）
+    test_results: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="测试执行结果历史（每次 run_tests 追加一条），格式同 AgentSession.test_results",
+    )
 
 
 class ToolConfirmRequest(BaseModel):

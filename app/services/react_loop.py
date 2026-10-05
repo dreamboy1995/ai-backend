@@ -374,6 +374,35 @@ def _save_preserving_flags(session: AgentSession, store) -> None:
     store.save(session)
 
 
+def _record_run_tests_result(session: AgentSession, result, store) -> None:
+    """
+    将 run_tests 工具的执行结果追加到 session.test_results 并持久化。
+
+    ToolResult.output 结构（见 tool_registry.tool_run_tests）：
+      {"summary": "...", "test_result": TestRunResult.model_dump()}
+    本函数提取 test_result 子字典追加——格式与 self_repair 里写入的一致。
+
+    容错：任何异常只记 warning，不中断主流程。
+    """
+    try:
+        output = result.output
+        if not isinstance(output, dict):
+            return
+        record = output.get("test_result") or output
+        if not isinstance(record, dict):
+            return
+        session.test_results.append(record)
+        store.save(session)
+        logger.debug(
+            f"[ReAct] run_tests 结果已追加到 session: "
+            f"session={session.session_id}, total_records={len(session.test_results)}"
+        )
+    except Exception as e:
+        logger.warning(
+            f"[ReAct] run_tests 结果持久化失败（不影响主流程）: {e}"
+        )
+
+
 def _mark_session_end(
     session: AgentSession, end_reason: str, end_message: Optional[str] = None
 ) -> None:
@@ -595,6 +624,14 @@ async def run_agent(
                 sm.mark_failed(step.id, f"工具执行异常: {e}")
                 _save_preserving_flags(session, store)
                 continue
+
+            # ---- S9 第 85-86 天：run_tests 工具结果写回 session.test_results ----
+            # Agent 主动调用 run_tests 时，ToolResult.output 结构为：
+            #   {"summary": "...", "test_result": TestRunResult.model_dump()}
+            # 提取 test_result 子字典（与 self_repair._run_tests_after_repair
+            # 写入格式一致），追加到 session.test_results 并持久化。
+            if tool == "run_tests":
+                _record_run_tests_result(session, result, store)
 
             # ---- 确认检测（S8 确认链路）----
             # 当 ToolResult.requires_confirmation=True 时，

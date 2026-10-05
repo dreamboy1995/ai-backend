@@ -93,6 +93,37 @@ async def _should_run_tests(session: AgentSession, step: TaskStep) -> bool:
     return _session_has_tests_cache[session_id]
 
 
+# ============================================================
+# S9 第 85-86 天：测试结果持久化辅助函数
+# ============================================================
+
+def _append_test_result_to_session(session: AgentSession, result) -> None:
+    """
+    将 TestRunResult 追加到 session.test_results 并持久化到 Redis。
+
+    追加的结构为 TestRunResult.model_dump()（含 success, summary, failures,
+    passed/failed/errors/skipped/total, framework, duration_ms 等完整字段）。
+    调用方不需要单独再调用 store.save(session) —— 本函数内部已处理。
+
+    容错：任何异常只记 warning，不中断自修复主流程（测试结果持久化是旁路）。
+    """
+    from app.services.agent_session_store import get_agent_session_store
+
+    try:
+        record = result.model_dump()
+        session.test_results.append(record)
+        store = get_agent_session_store()
+        store.save(session)
+        logger.debug(
+            f"[SelfRepair] 测试结果已追加到 session: session={session.session_id}, "
+            f"total_records={len(session.test_results)}"
+        )
+    except Exception as e:
+        logger.warning(
+            f"[SelfRepair] 测试结果持久化失败（不影响自修复流程）: {e}"
+        )
+
+
 async def _run_tests_after_repair(
     session: AgentSession,
     step: TaskStep,
@@ -137,6 +168,11 @@ async def _run_tests_after_repair(
         f"[SelfRepair] run_tests 结果: passed={result.passed}, "
         f"failed={result.failed}, errors={result.errors}, summary={summary}"
     )
+
+    # ---- S9 第 85-86 天：将测试结果追加到 session.test_results 并持久化 ----
+    # 让前端 Builder 面板通过 /v1/agent/status/{id} 拿到测试时间线数据源。
+    # 无论测试通过、失败、超时还是框架不可用，都记录下来供 UI 渲染。
+    _append_test_result_to_session(session, result)
 
     # 测试通过或超时但已有基本通过 → 不干扰自修复流程
     if result.success:
